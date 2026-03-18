@@ -71,12 +71,23 @@ export default function MemoryMachine() {
   const [log, setLog] = useState<LogEntry[]>([])
   const [input, setInput] = useState('')
   const [area, setArea] = useState('general')
-  const [view, setView] = useState<'log' | 'stable' | 'export'>('log')
+  const [view, setView] = useState<'log' | 'stable' | 'export' | 'tasks'>('log')
   const [copied, setCopied] = useState(false)
   const [exportMessage, setExportMessage] = useState<string | null>(null)
   const [editingStable, setEditingStable] = useState(false)
   const [stableDraft, setStableDraft] = useState('')
   const inputRef = useRef<HTMLInputElement>(null)
+
+  const [tasks, setTasks] = useState<any[]>([])
+  const [proposed, setProposed] = useState<any[]>([])
+  const [projects, setProjects] = useState<any[]>([])
+  const [dailyLogs, setDailyLogs] = useState<any[]>([])
+  const [taskSubView, setTaskSubView] = useState<'reconcile' | 'today' | 'done'>('reconcile')
+  const [taskFilter, setTaskFilter] = useState<'active' | 'waiting' | 'someday' | 'all'>('active')
+  const [ollamaOk, setOllamaOk] = useState<boolean | null>(null)
+  const [newTaskTitle, setNewTaskTitle] = useState('')
+  const [newTaskProject, setNewTaskProject] = useState('')
+  const [newTaskPriority, setNewTaskPriority] = useState('soon')
 
   useEffect(() => {
     const s = localStorage.getItem(STABLE_KEY)
@@ -85,6 +96,31 @@ export default function MemoryMachine() {
     if (l) setLog(JSON.parse(l))
     setTimeout(() => inputRef.current?.focus(), 100)
   }, [])
+
+  async function loadTasks() {
+    const res = await fetch('/api/tasks')
+    const data = await res.json()
+    setTasks(data.tasks)
+    setProposed(data.proposed)
+    setProjects(data.projects)
+    setDailyLogs(data.dailyLogs)
+  }
+
+  async function checkOllama() {
+    try {
+      await fetch('http://localhost:11434/', { signal: AbortSignal.timeout(2000) })
+      setOllamaOk(true)
+    } catch {
+      setOllamaOk(false)
+    }
+  }
+
+  useEffect(() => {
+    if (view === 'tasks') {
+      loadTasks()
+      checkOllama()
+    }
+  }, [view])
 
   function saveLog(entries: LogEntry[]) {
     setLog(entries)
@@ -105,6 +141,15 @@ export default function MemoryMachine() {
       area: area !== 'general' ? area : undefined
     }
     saveLog([entry, ...log])
+    fetch('/api/ingest', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: entry.id,
+        timestamp: entry.ts,
+        content: entry.text,
+      }),
+    }).catch(() => {})
     setInput('')
     inputRef.current?.focus()
   }
@@ -179,6 +224,79 @@ ${logMd}
     }
   }
 
+  async function approveTask(p: any) {
+    await fetch('/api/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'approve',
+        proposedId: p.id,
+        title: p.title,
+        project: p.project,
+        priority: p.priority,
+        status: p.status,
+      }),
+    })
+    await loadTasks()
+  }
+
+  async function dismissTask(proposedId: string) {
+    await fetch('/api/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'dismiss', proposedId }),
+    })
+    await loadTasks()
+  }
+
+  async function markDone(taskId: string) {
+    await fetch('/api/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'done', taskId }),
+    })
+    await loadTasks()
+  }
+
+  async function updateTask(taskId: string, fields: Record<string, string>) {
+    await fetch('/api/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'update', taskId, ...fields }),
+    })
+    await loadTasks()
+  }
+
+  async function addQuickTask() {
+    if (!newTaskTitle.trim()) return
+    await fetch('/api/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'create',
+        title: newTaskTitle.trim(),
+        project: newTaskProject || null,
+        priority: newTaskPriority,
+        status: 'active',
+      }),
+    })
+    setNewTaskTitle('')
+    await loadTasks()
+  }
+
+  async function copyDoneLog() {
+    const today = new Date().toISOString().split('T')[0]
+    const todayDone = dailyLogs.filter((l: any) => l.log_date === today)
+    if (todayDone.length === 0) return
+    const lines = todayDone.map((l: any) =>
+      `- ${l.task_title}${l.project ? `  [${l.project}]` : ''}`
+    ).join('\n')
+    const md = `## Done — ${today}\n${lines}`
+    await navigator.clipboard.writeText(md)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
+
   const todayKey = new Date().toISOString().split('T')[0]
   const todayEntries = log.filter(e => e.ts.startsWith(todayKey))
   const groups = groupByDay([...log].reverse())
@@ -208,7 +326,7 @@ ${logMd}
           <span style={{ fontSize: 11, color: '#444', letterSpacing: '0.1em' }}>v2</span>
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          {(['log', 'stable', 'export'] as const).map(v => (
+          {(['log', 'stable', 'export', 'tasks'] as const).map(v => (
             <button key={v} onClick={() => setView(v)} style={{
               background: view === v ? '#1a1a1a' : 'transparent',
               border: view === v ? '1px solid #333' : '1px solid transparent',
@@ -495,6 +613,294 @@ ${logMd}
             }}>
               {buildExport()}
             </pre>
+          </div>
+        )}
+
+        {view === 'tasks' && (
+          <div>
+            {ollamaOk === false && (
+              <div style={{
+                background: '#1a1200', border: '1px solid #3a2800',
+                color: '#c8a050', padding: '8px 14px', borderRadius: 3,
+                fontSize: 11, letterSpacing: '0.08em', marginBottom: 16,
+              }}>
+                local ai unavailable — manual task entry still works
+              </div>
+            )}
+
+            <div style={{ display: 'flex', gap: 6, marginBottom: 20 }}>
+              {(['reconcile', 'today', 'done'] as const).map(sv => (
+                <button key={sv} onClick={() => setTaskSubView(sv)} style={{
+                  background: taskSubView === sv ? '#1a1a1a' : 'transparent',
+                  border: taskSubView === sv ? '1px solid #333' : '1px solid transparent',
+                  color: taskSubView === sv ? '#e8e4dc' : '#555',
+                  padding: '4px 12px', fontSize: 11, letterSpacing: '0.1em',
+                  cursor: 'pointer', borderRadius: 3, textTransform: 'uppercase',
+                  fontFamily: 'inherit',
+                }}>
+                  {sv}
+                  {sv === 'reconcile' && proposed.length > 0 && (
+                    <span style={{
+                      marginLeft: 6, background: '#c8b89a', color: '#0a0a0a',
+                      borderRadius: 8, padding: '0 5px', fontSize: 9, fontWeight: 700,
+                    }}>
+                      {proposed.length}
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
+
+            <div style={{
+              display: 'flex', gap: 8, marginBottom: 24,
+              paddingBottom: 20, borderBottom: '1px solid #1a1a1a',
+            }}>
+              <input
+                value={newTaskTitle}
+                onChange={e => setNewTaskTitle(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') addQuickTask() }}
+                placeholder="add task..."
+                style={{
+                  flex: 1, background: '#141414', border: '1px solid #2a2a2a',
+                  color: '#e8e4dc', padding: '7px 12px', fontSize: 12,
+                  borderRadius: 3, outline: 'none', fontFamily: 'inherit',
+                }}
+              />
+              <select
+                value={newTaskProject}
+                onChange={e => setNewTaskProject(e.target.value)}
+                style={{
+                  background: '#141414', border: '1px solid #2a2a2a', color: '#888',
+                  padding: '7px 10px', fontSize: 11, borderRadius: 3, cursor: 'pointer',
+                  fontFamily: 'inherit',
+                }}
+              >
+                <option value="">no project</option>
+                {projects.map((p: any) => (
+                  <option key={p.id} value={p.name}>{p.name}</option>
+                ))}
+              </select>
+              <select
+                value={newTaskPriority}
+                onChange={e => setNewTaskPriority(e.target.value)}
+                style={{
+                  background: '#141414', border: '1px solid #2a2a2a', color: '#888',
+                  padding: '7px 10px', fontSize: 11, borderRadius: 3, cursor: 'pointer',
+                  fontFamily: 'inherit',
+                }}
+              >
+                <option value="now">now</option>
+                <option value="soon">soon</option>
+                <option value="later">later</option>
+              </select>
+              <button onClick={addQuickTask} disabled={!newTaskTitle.trim()} style={{
+                background: newTaskTitle.trim() ? '#c8b89a' : '#1a1a1a',
+                border: 'none', color: newTaskTitle.trim() ? '#0a0a0a' : '#333',
+                padding: '7px 14px', fontSize: 11, letterSpacing: '0.1em',
+                cursor: newTaskTitle.trim() ? 'pointer' : 'default',
+                borderRadius: 3, fontFamily: 'inherit', fontWeight: 600,
+                textTransform: 'uppercase',
+              }}>
+                add
+              </button>
+            </div>
+
+            {taskSubView === 'reconcile' && (
+              <div>
+                {proposed.length === 0 ? (
+                  <div style={{ color: '#333', fontSize: 12, letterSpacing: '0.08em' }}>
+                    no proposed tasks. log an entry to extract tasks automatically.
+                  </div>
+                ) : (
+                  <div>
+                    <div style={{
+                      fontSize: 10, color: '#555', letterSpacing: '0.12em',
+                      textTransform: 'uppercase', marginBottom: 12,
+                    }}>
+                      {proposed.length} proposed {proposed.length === 1 ? 'task' : 'tasks'} from your log
+                    </div>
+                    {proposed.map((p: any) => (
+                      <div key={p.id} style={{
+                        background: '#0d0d0d', border: '1px solid #222',
+                        borderRadius: 3, padding: '12px 14px', marginBottom: 8,
+                      }}>
+                        <div style={{ fontSize: 13, color: '#e8e4dc', marginBottom: 8 }}>{p.title}</div>
+                        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                          {p.project && (
+                            <span style={{
+                              fontSize: 9, letterSpacing: '0.1em', color: '#c8b89a',
+                              textTransform: 'uppercase',
+                            }}>
+                              {p.project}
+                            </span>
+                          )}
+                          <span style={{ fontSize: 9, color: '#444', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+                            {p.priority} · {p.status}
+                          </span>
+                          <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+                            <button onClick={() => approveTask(p)} style={btnStyle('#c8b89a', '#0a0a0a')}>add</button>
+                            <button onClick={() => dismissTask(p.id)} style={btnStyle('#1a1a1a', '#666')}>dismiss</button>
+                          </div>
+                        </div>
+                        {p.source_text && (
+                          <div style={{
+                            marginTop: 8, fontSize: 10, color: '#333',
+                            borderTop: '1px solid #1a1a1a', paddingTop: 6,
+                            fontStyle: 'italic',
+                          }}>
+                            {p.source_text.length > 120 ? p.source_text.slice(0, 120) + '…' : p.source_text}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                    <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
+                      <button
+                        onClick={async () => { for (const p of proposed) await approveTask(p) }}
+                        style={btnStyle('#c8b89a', '#0a0a0a')}
+                      >
+                        add all
+                      </button>
+                      <button
+                        onClick={async () => { for (const p of proposed) await dismissTask(p.id) }}
+                        style={btnStyle('#1a1a1a', '#666')}
+                      >
+                        dismiss all
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {taskSubView === 'today' && (
+              <div>
+                <div style={{ display: 'flex', gap: 6, marginBottom: 16 }}>
+                  {(['active', 'waiting', 'someday', 'all'] as const).map(f => (
+                    <button key={f} onClick={() => setTaskFilter(f)} style={{
+                      background: taskFilter === f ? '#1a1a1a' : 'transparent',
+                      border: taskFilter === f ? '1px solid #333' : '1px solid transparent',
+                      color: taskFilter === f ? '#e8e4dc' : '#444',
+                      padding: '3px 10px', fontSize: 10, letterSpacing: '0.1em',
+                      cursor: 'pointer', borderRadius: 3, textTransform: 'uppercase',
+                      fontFamily: 'inherit',
+                    }}>{f}</button>
+                  ))}
+                </div>
+
+                {(['now', 'soon', 'later'] as const).map(priority => {
+                  const filtered = tasks.filter((t: any) =>
+                    t.priority === priority &&
+                    t.status !== 'done' && t.status !== 'archived' &&
+                    (taskFilter === 'all' || t.status === taskFilter)
+                  )
+                  if (filtered.length === 0) return null
+                  return (
+                    <div key={priority} style={{ marginBottom: 24 }}>
+                      <div style={{
+                        fontSize: 10, color: '#555', letterSpacing: '0.15em',
+                        textTransform: 'uppercase', marginBottom: 10,
+                        paddingBottom: 6, borderBottom: '1px solid #1a1a1a',
+                      }}>
+                        {priority}
+                      </div>
+                      {filtered.map((t: any) => (
+                        <div key={t.id} style={{
+                          display: 'flex', gap: 10, alignItems: 'flex-start',
+                          padding: '8px 0', borderBottom: '1px solid #141414',
+                        }}>
+                          <button
+                            onClick={() => markDone(t.id)}
+                            title="mark done"
+                            style={{
+                              width: 16, height: 16, borderRadius: '50%',
+                              border: '1px solid #444', background: 'none',
+                              cursor: 'pointer', flexShrink: 0, marginTop: 2,
+                            }}
+                          />
+                          <div style={{ flex: 1 }}>
+                            <div style={{ fontSize: 13, color: '#d4cfc7' }}>{t.title}</div>
+                            {t.project && (
+                              <div style={{ fontSize: 10, color: '#c8b89a', letterSpacing: '0.08em', marginTop: 2 }}>
+                                {t.project}
+                              </div>
+                            )}
+                          </div>
+                          <select
+                            value={t.status}
+                            onChange={e => updateTask(t.id, { status: e.target.value })}
+                            style={{
+                              background: '#141414', border: '1px solid #222',
+                              color: '#555', fontSize: 10, padding: '2px 6px',
+                              borderRadius: 3, cursor: 'pointer', fontFamily: 'inherit',
+                            }}
+                          >
+                            <option value="active">active</option>
+                            <option value="waiting">waiting</option>
+                            <option value="someday">someday</option>
+                          </select>
+                        </div>
+                      ))}
+                    </div>
+                  )
+                })}
+
+                {tasks.filter((t: any) => t.status !== 'done' && t.status !== 'archived').length === 0 && (
+                  <div style={{ color: '#333', fontSize: 12, letterSpacing: '0.08em' }}>
+                    no active tasks. add one above or approve from reconcile.
+                  </div>
+                )}
+              </div>
+            )}
+
+            {taskSubView === 'done' && (
+              <div>
+                <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 16 }}>
+                  <button onClick={copyDoneLog} style={btnStyle('#1a1a1a', copied ? '#c8b89a' : '#888')}>
+                    {copied ? '✓ copied' : "copy today's log"}
+                  </button>
+                </div>
+                {dailyLogs.length === 0 ? (
+                  <div style={{ color: '#333', fontSize: 12, letterSpacing: '0.08em' }}>
+                    no completed tasks yet.
+                  </div>
+                ) : (
+                  Object.entries(
+                    dailyLogs.reduce((acc: Record<string, any[]>, l: any) => {
+                      if (!acc[l.log_date]) acc[l.log_date] = []
+                      acc[l.log_date].push(l)
+                      return acc
+                    }, {})
+                  ).map(([date, entries]) => (
+                    <div key={date} style={{ marginBottom: 24 }}>
+                      <div style={{
+                        fontSize: 10, color: '#555', letterSpacing: '0.15em',
+                        textTransform: 'uppercase', marginBottom: 10,
+                        paddingBottom: 6, borderBottom: '1px solid #1a1a1a',
+                      }}>
+                        {new Date(date).toLocaleDateString('en-GB', {
+                          weekday: 'long', day: 'numeric', month: 'long'
+                        })}
+                      </div>
+                      {(entries as any[]).map((l: any) => (
+                        <div key={l.id} style={{
+                          display: 'flex', gap: 10, padding: '6px 0',
+                          borderBottom: '1px solid #141414', alignItems: 'baseline',
+                        }}>
+                          <span style={{ fontSize: 13, color: '#d4cfc7', flex: 1 }}>
+                            {l.task_title}
+                          </span>
+                          {l.project && (
+                            <span style={{ fontSize: 10, color: '#c8b89a', letterSpacing: '0.08em' }}>
+                              {l.project}
+                            </span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
           </div>
         )}
       </div>
