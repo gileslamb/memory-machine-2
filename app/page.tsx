@@ -4,12 +4,28 @@ import { useState, useEffect, useRef } from 'react'
 
 const STABLE_KEY = 'mm_stable'
 const LOG_KEY = 'mm_log'
+const ARCHIVE_KEY = 'mm_archive'
+const ANALYSIS_KEY = 'mm_analysis'
+
+const DOMAINS = ['projects', 'finance', 'health', 'personal'] as const
+type Domain = typeof DOMAINS[number]
+const DOMAIN_KEYS: Record<Domain, string> = {
+  projects: 'mm_domain_projects',
+  finance: 'mm_domain_finance',
+  health: 'mm_domain_health',
+  personal: 'mm_domain_personal',
+}
 
 interface LogEntry {
   id: string
   ts: string
   text: string
   area?: string
+  domain?: Domain | null
+}
+
+interface DomainEntry extends LogEntry {
+  distillationStatus?: 'pending' | 'done' | 'failed'
 }
 
 const AREAS = ['projects', 'admin', 'vision', 'life', 'general']
@@ -71,7 +87,9 @@ export default function MemoryMachine() {
   const [log, setLog] = useState<LogEntry[]>([])
   const [input, setInput] = useState('')
   const [area, setArea] = useState('general')
-  const [view, setView] = useState<'log' | 'stable' | 'export' | 'tasks'>('log')
+  const [domain, setDomain] = useState<Domain | null>(null)
+  const [view, setView] = useState<'log' | 'stable' | 'export' | 'domains' | 'archive' | 'analysis' | 'tasks' | 'help'>('log')
+  const [domainView, setDomainView] = useState<Domain>('projects')
   const [copied, setCopied] = useState(false)
   const [exportMessage, setExportMessage] = useState<string | null>(null)
   const [editingStable, setEditingStable] = useState(false)
@@ -89,11 +107,25 @@ export default function MemoryMachine() {
   const [newTaskProject, setNewTaskProject] = useState('')
   const [newTaskPriority, setNewTaskPriority] = useState('soon')
 
+  const [archive, setArchive] = useState<Array<{ week: string; archivedAt: string; entries: LogEntry[] }>>([])
+  const [analysisEntries, setAnalysisEntries] = useState<Array<{ id: string; savedAt: string; text: string }>>([])
+  const [expandedWeeks, setExpandedWeeks] = useState<Set<string>>(new Set())
+  const [expandedAnalyses, setExpandedAnalyses] = useState<Set<string>>(new Set())
+  const [archiveMessage, setArchiveMessage] = useState<string | null>(null)
+  const [analysisDraft, setAnalysisDraft] = useState('')
+  const [editingTagEntryId, setEditingTagEntryId] = useState<string | null>(null)
+  const [domainRefreshTrigger, setDomainRefreshTrigger] = useState(0)
+  const [domainEntries, setDomainEntries] = useState<DomainEntry[]>([])
+
   useEffect(() => {
     const s = localStorage.getItem(STABLE_KEY)
     const l = localStorage.getItem(LOG_KEY)
+    const a = localStorage.getItem(ARCHIVE_KEY)
+    const an = localStorage.getItem(ANALYSIS_KEY)
     if (s) setStable(s)
     if (l) setLog(JSON.parse(l))
+    if (a) setArchive(JSON.parse(a))
+    if (an) setAnalysisEntries(JSON.parse(an))
     setTimeout(() => inputRef.current?.focus(), 100)
   }, [])
 
@@ -122,6 +154,12 @@ export default function MemoryMachine() {
     }
   }, [view])
 
+  useEffect(() => {
+    if (view === 'domains') {
+      setDomainEntries(getDomainEntries(domainView))
+    }
+  }, [view, domainView, domainRefreshTrigger])
+
   function saveLog(entries: LogEntry[]) {
     setLog(entries)
     localStorage.setItem(LOG_KEY, JSON.stringify(entries))
@@ -132,15 +170,95 @@ export default function MemoryMachine() {
     localStorage.setItem(STABLE_KEY, text)
   }
 
+  function updateDomainEntryInStorage(domainKey: string, entryId: string, updater: (e: DomainEntry) => DomainEntry) {
+    const existing = localStorage.getItem(domainKey)
+    if (!existing) return
+    const arr: DomainEntry[] = JSON.parse(existing)
+    const idx = arr.findIndex((e: DomainEntry) => e.id === entryId)
+    if (idx < 0) return
+    arr[idx] = updater(arr[idx])
+    localStorage.setItem(domainKey, JSON.stringify(arr))
+    setDomainRefreshTrigger(n => n + 1)
+  }
+
+  async function distillAndAppendToDomainLog(domainKey: string, entry: LogEntry, onComplete?: () => void) {
+    const domainEntry: DomainEntry = { ...entry, distillationStatus: 'pending' }
+    const existing = localStorage.getItem(domainKey)
+    const arr: DomainEntry[] = existing ? JSON.parse(existing) : []
+    arr.push(domainEntry)
+    localStorage.setItem(domainKey, JSON.stringify(arr))
+    setDomainRefreshTrigger(n => n + 1)
+
+    try {
+      const res = await fetch('/api/distill', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: entry.text }),
+      })
+      if (res.ok) {
+        const { distilled } = await res.json()
+        updateDomainEntryInStorage(domainKey, entry.id, e => ({
+          ...e,
+          text: distilled,
+          distillationStatus: 'done',
+        }))
+      } else {
+        updateDomainEntryInStorage(domainKey, entry.id, e => ({
+          ...e,
+          distillationStatus: 'failed',
+        }))
+      }
+    } catch {
+      updateDomainEntryInStorage(domainKey, entry.id, e => ({
+        ...e,
+        distillationStatus: 'failed',
+      }))
+    }
+    onComplete?.()
+  }
+
+  function removeFromDomainLog(domainKey: string, entryId: string) {
+    const existing = localStorage.getItem(domainKey)
+    if (!existing) return
+    const arr: LogEntry[] = JSON.parse(existing).filter((e: LogEntry) => e.id !== entryId)
+    localStorage.setItem(domainKey, JSON.stringify(arr))
+  }
+
+  function assignDomainToEntry(entry: LogEntry, newDomain: Domain) {
+    const oldDomain = entry.domain
+    if (oldDomain === newDomain) {
+      setEditingTagEntryId(null)
+      return
+    }
+    if (oldDomain) removeFromDomainLog(DOMAIN_KEYS[oldDomain], entry.id)
+    const updated: LogEntry = { ...entry, domain: newDomain }
+    const newLog = log.map(e => e.id === entry.id ? updated : e)
+    saveLog(newLog)
+    distillAndAppendToDomainLog(DOMAIN_KEYS[newDomain], updated)
+    setEditingTagEntryId(null)
+  }
+
+  function clearEntryDomain(entry: LogEntry) {
+    if (entry.domain) {
+      removeFromDomainLog(DOMAIN_KEYS[entry.domain], entry.id)
+    }
+    const updated: LogEntry = { ...entry, domain: undefined }
+    const newLog = log.map(e => e.id === entry.id ? updated : e)
+    saveLog(newLog)
+    setEditingTagEntryId(null)
+  }
+
   function addEntry() {
     if (!input.trim()) return
     const entry: LogEntry = {
       id: Date.now().toString(),
       ts: new Date().toISOString(),
       text: input.trim(),
-      area: area !== 'general' ? area : undefined
+      area: area !== 'general' ? area : undefined,
+      domain: domain ?? undefined,
     }
     saveLog([entry, ...log])
+    if (domain) distillAndAppendToDomainLog(DOMAIN_KEYS[domain], entry)
     fetch('/api/ingest', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -151,6 +269,7 @@ export default function MemoryMachine() {
       }),
     }).catch(() => {})
     setInput('')
+    setDomain(null)
     inputRef.current?.focus()
   }
 
@@ -165,7 +284,7 @@ export default function MemoryMachine() {
         .map(([day, entries]) => {
           const header = `## ${new Date(day).toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}`
           const lines = entries.reverse().map(e =>
-            `### ${new Date(e.ts).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}${e.area ? ` · ${e.area}` : ''}\n${e.text}`
+            `### ${new Date(e.ts).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}${(e.area || e.domain) ? ` · ${e.domain || e.area}` : ''}\n${e.text}`
           ).join('\n\n')
           return header + '\n\n' + lines
         }).join('\n\n---\n\n')
@@ -208,6 +327,68 @@ ${logMd}
     if (confirm('Clear all log entries? Make sure you\'ve done your weekly synthesis first.')) {
       saveLog([])
     }
+  }
+
+  function archiveAndClear() {
+    if (!confirm('Archive this week\'s log and clear? This cannot be undone.')) return
+    const now = new Date()
+    const weekStart = new Date(now)
+    weekStart.setDate(now.getDate() - now.getDay())
+    const weekStr = weekStart.toISOString().split('T')[0]
+    const block = {
+      week: weekStr,
+      archivedAt: now.toISOString(),
+      entries: [...log],
+    }
+    const existing = localStorage.getItem(ARCHIVE_KEY)
+    const arr: typeof archive = existing ? JSON.parse(existing) : []
+    arr.unshift(block)
+    localStorage.setItem(ARCHIVE_KEY, JSON.stringify(arr))
+    setArchive(arr)
+    saveLog([])
+    setArchiveMessage('Archived and cleared.')
+    setTimeout(() => setArchiveMessage(null), 3000)
+  }
+
+  function saveAnalysis() {
+    if (!analysisDraft.trim()) return
+    const entry = {
+      id: Date.now().toString(),
+      savedAt: new Date().toISOString(),
+      text: analysisDraft.trim(),
+    }
+    const next = [entry, ...analysisEntries]
+    setAnalysisEntries(next)
+    localStorage.setItem(ANALYSIS_KEY, JSON.stringify(next))
+    setAnalysisDraft('')
+  }
+
+  function copyAllAnalyses() {
+    const lines = analysisEntries.map((e: { id: string; savedAt: string; text: string }) =>
+      `## ${new Date(e.savedAt).toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}\n\n${e.text}`
+    ).join('\n\n---\n\n')
+    const md = `# Weekly Analysis Archive\n\n${lines}`
+    navigator.clipboard.writeText(md)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
+
+  function toggleWeek(week: string) {
+    setExpandedWeeks(prev => {
+      const next = new Set(prev)
+      if (next.has(week)) next.delete(week)
+      else next.add(week)
+      return next
+    })
+  }
+
+  function toggleAnalysis(id: string) {
+    setExpandedAnalyses(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
   }
 
   async function handleExport() {
@@ -301,6 +482,27 @@ ${logMd}
   const todayEntries = log.filter(e => e.ts.startsWith(todayKey))
   const groups = groupByDay([...log].reverse())
 
+  function getDomainEntries(d: Domain): DomainEntry[] {
+    if (typeof window === 'undefined') return []
+    const raw = localStorage.getItem(DOMAIN_KEYS[d])
+    if (!raw) return []
+    const arr = JSON.parse(raw)
+    return [...arr].sort((a: DomainEntry, b: DomainEntry) => a.ts.localeCompare(b.ts))
+  }
+
+
+  function copyDomainExport(d: Domain) {
+    const entries = getDomainEntries(d)
+    const label = d.charAt(0).toUpperCase() + d.slice(1)
+    const lines = entries.map((e: DomainEntry) =>
+      `${new Date(e.ts).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })} — ${e.text}`
+    ).join('\n')
+    const md = `## ${label} Context Log\nExported: ${new Date().toISOString()}\n\n---\n\n${lines}`
+    navigator.clipboard.writeText(md)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
+
   return (
     <div style={{
       minHeight: '100vh',
@@ -326,7 +528,7 @@ ${logMd}
           <span style={{ fontSize: 11, color: '#444', letterSpacing: '0.1em' }}>v2</span>
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          {(['log', 'stable', 'export', 'tasks'] as const).map(v => (
+          {(['log', 'stable', 'export', 'domains', 'archive', 'analysis', 'tasks', 'help'] as const).map(v => (
             <button key={v} onClick={() => setView(v)} style={{
               background: view === v ? '#1a1a1a' : 'transparent',
               border: view === v ? '1px solid #333' : '1px solid transparent',
@@ -343,11 +545,14 @@ ${logMd}
           ))}
           {view === 'log' && (
             <>
-              {exportMessage && (
-                <span style={{ fontSize: 10, color: '#c8b89a', letterSpacing: '0.08em' }}>{exportMessage}</span>
+              {(exportMessage || archiveMessage) && (
+                <span style={{ fontSize: 10, color: '#c8b89a', letterSpacing: '0.08em' }}>{exportMessage || archiveMessage}</span>
               )}
               <button onClick={handleExport} style={btnStyle('#c8b89a', '#0a0a0a')}>
                 Export log
+              </button>
+              <button onClick={archiveAndClear} disabled={log.length === 0} style={btnStyle(log.length ? '#1a1a1a' : '#0d0d0d', log.length ? '#888' : '#333')}>
+                Archive & Clear
               </button>
             </>
           )}
@@ -415,6 +620,28 @@ ${logMd}
             LOG
           </button>
         </div>
+        <div style={{ display: 'flex', gap: 6, marginTop: 8, flexWrap: 'wrap' }}>
+          {DOMAINS.map(d => (
+            <button
+              key={d}
+              onClick={() => setDomain(domain === d ? null : d)}
+              style={{
+                background: domain === d ? '#c8b89a' : 'transparent',
+                border: domain === d ? '1px solid #c8b89a' : '1px solid #2a2a2a',
+                color: domain === d ? '#0a0a0a' : '#555',
+                padding: '4px 10px',
+                fontSize: 10,
+                letterSpacing: '0.08em',
+                cursor: 'pointer',
+                borderRadius: 3,
+                fontFamily: 'inherit',
+                textTransform: 'capitalize',
+              }}
+            >
+              {d}
+            </button>
+          ))}
+        </div>
         <div style={{ marginTop: 6, fontSize: 10, color: '#333', letterSpacing: '0.08em' }}>
           {todayEntries.length} {todayEntries.length === 1 ? 'entry' : 'entries'} today
           {log.length > todayEntries.length && ` · ${log.length} total`}
@@ -446,46 +673,106 @@ ${logMd}
                   </div>
                   {entries.map(entry => (
                     <div key={entry.id} style={{
-                      display: 'flex',
-                      gap: 12,
                       marginBottom: 8,
                       padding: '8px 0',
                       borderBottom: '1px solid #141414',
-                      alignItems: 'flex-start',
                     }}>
-                      <span style={{ fontSize: 10, color: '#444', whiteSpace: 'nowrap', paddingTop: 2, minWidth: 80 }}>
-                        {new Date(entry.ts).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}
-                      </span>
-                      {entry.area && (
-                        <span style={{
-                          fontSize: 9,
-                          letterSpacing: '0.1em',
-                          color: '#c8b89a',
-                          textTransform: 'uppercase',
-                          paddingTop: 3,
-                          minWidth: 55,
-                        }}>
-                          {entry.area}
+                      <div style={{
+                        display: 'flex',
+                        gap: 12,
+                        alignItems: 'flex-start',
+                      }}>
+                        <span style={{ fontSize: 10, color: '#444', whiteSpace: 'nowrap', paddingTop: 2, minWidth: 80 }}>
+                          {new Date(entry.ts).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}
                         </span>
-                      )}
-                      <span style={{ flex: 1, fontSize: 13, lineHeight: 1.5, color: '#d4cfc7' }}>
-                        {entry.text}
-                      </span>
-                      <button
-                        onClick={() => deleteEntry(entry.id)}
-                        style={{
-                          background: 'none',
-                          border: 'none',
-                          color: '#333',
-                          cursor: 'pointer',
-                          fontSize: 14,
-                          padding: '0 4px',
-                          lineHeight: 1,
-                        }}
-                        title="delete"
-                      >
-                        ×
-                      </button>
+                        <div style={{ minWidth: 55, paddingTop: 2 }}>
+                          {editingTagEntryId === entry.id ? (
+                            <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                              {DOMAINS.map(d => (
+                                <button
+                                  key={d}
+                                  onClick={() => assignDomainToEntry(entry, d)}
+                                  style={{
+                                    background: (entry.domain || entry.area) === d ? '#c8b89a' : '#1a1a1a',
+                                    border: '1px solid #333',
+                                    color: (entry.domain || entry.area) === d ? '#0a0a0a' : '#666',
+                                    padding: '2px 6px',
+                                    fontSize: 9,
+                                    letterSpacing: '0.05em',
+                                    cursor: 'pointer',
+                                    borderRadius: 2,
+                                    fontFamily: 'inherit',
+                                    textTransform: 'capitalize',
+                                  }}
+                                >
+                                  {d}
+                                </button>
+                              ))}
+                              <button
+                                onClick={() => clearEntryDomain(entry)}
+                                style={{
+                                  background: 'none',
+                                  border: 'none',
+                                  color: '#444',
+                                  fontSize: 9,
+                                  cursor: 'pointer',
+                                  fontFamily: 'inherit',
+                                }}
+                              >
+                                clear
+                              </button>
+                            </div>
+                          ) : (
+                            <button
+                              onClick={() => setEditingTagEntryId(entry.id)}
+                              style={{
+                                background: 'none',
+                                border: 'none',
+                                padding: 0,
+                                cursor: 'pointer',
+                                fontFamily: 'inherit',
+                              }}
+                            >
+                              {(entry.domain || entry.area) ? (
+                                <span style={{
+                                  fontSize: 9,
+                                  letterSpacing: '0.1em',
+                                  color: '#c8b89a',
+                                  textTransform: 'uppercase',
+                                }}>
+                                  {entry.domain || entry.area}
+                                </span>
+                              ) : (
+                                <span style={{
+                                  fontSize: 9,
+                                  color: '#333',
+                                  letterSpacing: '0.05em',
+                                }}>
+                                  + tag
+                                </span>
+                              )}
+                            </button>
+                          )}
+                        </div>
+                        <span style={{ flex: 1, fontSize: 13, lineHeight: 1.5, color: '#d4cfc7' }}>
+                          {entry.text}
+                        </span>
+                        <button
+                          onClick={() => deleteEntry(entry.id)}
+                          style={{
+                            background: 'none',
+                            border: 'none',
+                            color: '#333',
+                            cursor: 'pointer',
+                            fontSize: 14,
+                            padding: '0 4px',
+                            lineHeight: 1,
+                          }}
+                          title="delete"
+                        >
+                          ×
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -596,7 +883,8 @@ ${logMd}
               <div>2. Open claude.ai (uses your subscription, not the API)</div>
               <div>3. Paste and send</div>
               <div>4. Copy the new AI_CONTEXT_STABLE.md back into the STABLE tab</div>
-              <div>5. Clear the log</div>
+              <div>5. Use Archive &amp; Clear (Log tab) to seal this week</div>
+              <div style={{ color: '#c8b89a', marginTop: 8, fontSize: 10 }}>After pasting this into Claude and receiving your refresh, use Archive &amp; Clear to seal this week.</div>
             </div>
             <pre style={{
               background: '#0d0d0d',
@@ -613,6 +901,220 @@ ${logMd}
             }}>
               {buildExport()}
             </pre>
+          </div>
+        )}
+
+        {view === 'domains' && (
+          <div>
+            <div style={{ display: 'flex', gap: 6, marginBottom: 20 }}>
+              {DOMAINS.map(d => (
+                <button
+                  key={d}
+                  onClick={() => setDomainView(d)}
+                  style={{
+                    background: domainView === d ? '#1a1a1a' : 'transparent',
+                    border: domainView === d ? '1px solid #333' : '1px solid transparent',
+                    color: domainView === d ? '#e8e4dc' : '#555',
+                    padding: '4px 12px', fontSize: 11, letterSpacing: '0.1em',
+                    cursor: 'pointer', borderRadius: 3, textTransform: 'capitalize',
+                    fontFamily: 'inherit',
+                  }}>
+                  {d}
+                </button>
+              ))}
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+              <span style={{ fontSize: 10, color: '#555', letterSpacing: '0.1em', textTransform: 'uppercase' }}>
+                {domainView} domain log
+              </span>
+              <button onClick={() => copyDomainExport(domainView)} style={btnStyle('#c8b89a', '#0a0a0a')}>
+                {copied ? '✓ copied' : 'Copy Domain Export'}
+              </button>
+            </div>
+            {domainEntries.length === 0 ? (
+              <div style={{ color: '#333', fontSize: 12, letterSpacing: '0.08em' }}>
+                no entries tagged to {domainView} yet.
+              </div>
+            ) : (
+              domainEntries.map((e: DomainEntry) => (
+                <div key={e.id} style={{
+                  padding: '8px 0',
+                  borderBottom: '1px solid #141414',
+                  lineHeight: 1.5,
+                }}>
+                  <span style={{ fontSize: 10, color: '#444', marginRight: 12 }}>
+                    {new Date(e.ts).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })} —{' '}
+                  </span>
+                  {e.distillationStatus === 'pending' ? (
+                    <span style={{ fontSize: 13, color: '#555', fontStyle: 'italic' }}>
+                      Distilling…
+                    </span>
+                  ) : e.distillationStatus === 'failed' ? (
+                    <span>
+                      <span style={{ fontSize: 13, color: '#888' }}>{e.text}</span>
+                      <span style={{ fontSize: 9, color: '#555', marginLeft: 8 }}>(distillation failed)</span>
+                    </span>
+                  ) : (
+                    <span style={{ fontSize: 13, color: '#d4cfc7', whiteSpace: 'pre-wrap' }}>
+                      {e.text}
+                    </span>
+                  )}
+                </div>
+              ))
+            )}
+          </div>
+        )}
+
+        {view === 'archive' && (
+          <div>
+            <div style={{ fontSize: 10, color: '#555', letterSpacing: '0.12em', textTransform: 'uppercase', marginBottom: 20 }}>
+              weekly archive
+            </div>
+            {archive.length === 0 ? (
+              <div style={{ color: '#333', fontSize: 12, letterSpacing: '0.08em' }}>
+                no archived weeks yet.
+              </div>
+            ) : (
+              archive.map((block) => {
+                const isExpanded = expandedWeeks.has(block.week)
+                return (
+                  <div key={block.week} style={{ marginBottom: 16 }}>
+                    <button
+                      onClick={() => toggleWeek(block.week)}
+                      style={{
+                        background: 'none',
+                        border: 'none',
+                        color: '#c8b89a',
+                        fontSize: 12,
+                        letterSpacing: '0.08em',
+                        cursor: 'pointer',
+                        fontFamily: 'inherit',
+                        padding: '8px 0',
+                        textAlign: 'left',
+                        width: '100%',
+                      }}
+                    >
+                      {isExpanded ? '▾' : '▸'} Week of {new Date(block.week).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })}
+                    </button>
+                    {isExpanded && (
+                      <div style={{
+                        background: '#0d0d0d',
+                        border: '1px solid #1a1a1a',
+                        borderRadius: 3,
+                        padding: 16,
+                        marginTop: 4,
+                      }}>
+                        {Object.entries(groupByDay([...block.entries].reverse())).reverse().map(([day, entries]) => (
+                          <div key={day} style={{ marginBottom: 16 }}>
+                            <div style={{ fontSize: 10, color: '#555', letterSpacing: '0.1em', marginBottom: 8 }}>
+                              {new Date(day).toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' })}
+                            </div>
+                            {entries.map((e: LogEntry) => (
+                              <div key={e.id} style={{
+                                fontSize: 12,
+                                color: '#888',
+                                marginBottom: 6,
+                                paddingLeft: 12,
+                                borderLeft: '1px solid #222',
+                              }}>
+                                {new Date(e.ts).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })} — {e.text}
+                              </div>
+                            ))}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )
+              })
+            )}
+          </div>
+        )}
+
+        {view === 'analysis' && (
+          <div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+              <span style={{ fontSize: 10, color: '#555', letterSpacing: '0.1em', textTransform: 'uppercase' }}>
+                weekly analysis log
+              </span>
+              <button onClick={copyAllAnalyses} style={btnStyle('#1a1a1a', copied ? '#c8b89a' : '#888')}>
+                {copied ? '✓ copied' : 'Copy All Analyses'}
+              </button>
+            </div>
+            <div style={{ marginBottom: 24 }}>
+              <textarea
+                value={analysisDraft}
+                onChange={e => setAnalysisDraft(e.target.value)}
+                placeholder="Paste your weekly AI analysis here..."
+                style={{
+                  width: '100%',
+                  minHeight: 120,
+                  background: '#0d0d0d',
+                  border: '1px solid #2a2a2a',
+                  color: '#e8e4dc',
+                  padding: 14,
+                  fontSize: 12,
+                  fontFamily: 'inherit',
+                  lineHeight: 1.6,
+                  borderRadius: 3,
+                  outline: 'none',
+                  resize: 'vertical',
+                  boxSizing: 'border-box',
+                }}
+              />
+              <button onClick={saveAnalysis} disabled={!analysisDraft.trim()} style={{
+                ...btnStyle(analysisDraft.trim() ? '#c8b89a' : '#1a1a1a', analysisDraft.trim() ? '#0a0a0a' : '#333'),
+                marginTop: 8,
+              }}>
+                Save Analysis
+              </button>
+            </div>
+            {analysisEntries.length === 0 ? (
+              <div style={{ color: '#333', fontSize: 12, letterSpacing: '0.08em' }}>
+                no analysis entries yet. Paste your weekly summary and hit Save.
+              </div>
+            ) : (
+              analysisEntries.map((e) => {
+                const isExpanded = expandedAnalyses.has(e.id)
+                return (
+                  <div key={e.id} style={{ marginBottom: 12 }}>
+                    <button
+                      onClick={() => toggleAnalysis(e.id)}
+                      style={{
+                        background: 'none',
+                        border: 'none',
+                        color: '#c8b89a',
+                        fontSize: 12,
+                        letterSpacing: '0.08em',
+                        cursor: 'pointer',
+                        fontFamily: 'inherit',
+                        padding: '8px 0',
+                        textAlign: 'left',
+                        width: '100%',
+                      }}
+                    >
+                      {isExpanded ? '▾' : '▸'} {new Date(e.savedAt).toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}
+                    </button>
+                    {isExpanded && (
+                      <pre style={{
+                        background: '#0d0d0d',
+                        border: '1px solid #1a1a1a',
+                        padding: 16,
+                        fontSize: 11,
+                        lineHeight: 1.6,
+                        borderRadius: 3,
+                        whiteSpace: 'pre-wrap',
+                        wordBreak: 'break-word',
+                        color: '#888',
+                        marginTop: 4,
+                      }}>
+                        {e.text}
+                      </pre>
+                    )}
+                  </div>
+                )
+              })
+            )}
           </div>
         )}
 
@@ -901,6 +1403,52 @@ ${logMd}
                 )}
               </div>
             )}
+          </div>
+        )}
+
+        {view === 'help' && (
+          <div style={{
+            background: '#0d0d0d',
+            border: '1px solid #1a1a1a',
+            borderRadius: 3,
+            padding: 24,
+            fontSize: 12,
+            lineHeight: 1.8,
+            color: '#c8c4bc',
+            fontFamily: 'inherit',
+          }}>
+            <div style={{ fontSize: 14, fontWeight: 600, color: '#c8b89a', marginBottom: 20, letterSpacing: '0.05em' }}>
+              How to use Memory Machine
+            </div>
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ fontSize: 11, color: '#888', marginBottom: 8, letterSpacing: '0.08em' }}>Daily (30 seconds)</div>
+              <div>Log by exception only — decisions, completions, realisations, shifts in thinking. Not activity. If nothing significant happened, don&apos;t log.</div>
+              <div style={{ marginTop: 6 }}>Tag the domain if relevant. If you forget, you can tag it after from the log.</div>
+            </div>
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ fontSize: 11, color: '#888', marginBottom: 8, letterSpacing: '0.08em' }}>After useful AI sessions</div>
+              <div>Ask the AI for a structured markdown summary of the conversation. Paste it as a log entry.</div>
+            </div>
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ fontSize: 11, color: '#888', marginBottom: 8, letterSpacing: '0.08em' }}>Weekly</div>
+              <div>1. Export tab → copy the full block</div>
+              <div>2. Paste into Claude → receive refreshed stable doc + analysis</div>
+              <div>3. Paste new stable doc back into Stable tab</div>
+              <div>4. Paste analysis into Analysis tab → Save</div>
+              <div>5. Hit Archive &amp; Clear</div>
+              <div>6. Done — five minutes maximum</div>
+            </div>
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ fontSize: 11, color: '#888', marginBottom: 8, letterSpacing: '0.08em' }}>Domain deep dive (ad hoc)</div>
+              <div>Open the relevant domain tab → Copy Domain Export → paste into a new AI chat with your specific question.</div>
+            </div>
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ fontSize: 11, color: '#888', marginBottom: 8, letterSpacing: '0.08em' }}>Quarterly</div>
+              <div>Analysis tab → Copy All Analyses → paste into Claude → ask for a meta-review. Trends, drift, progress over time.</div>
+            </div>
+            <div style={{ borderTop: '1px solid #222', paddingTop: 16, fontSize: 11, color: '#555' }}>
+              If adding an entry takes more than 20 seconds, the system is too complicated.
+            </div>
           </div>
         )}
       </div>
