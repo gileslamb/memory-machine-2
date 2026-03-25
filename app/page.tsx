@@ -2,8 +2,13 @@
 
 import { useState, useEffect, useRef } from 'react'
 
+/** ~16px→18px scale for readability */
+function fz(n: number) { return Math.round(n * 1.125) }
+
+
 const STABLE_KEY = 'mm_stable'
 const LOG_KEY = 'mm_log'
+const TASKS_PROJECTS_KEY = 'mm_tasks_projects'
 const ARCHIVE_KEY = 'mm_archive'
 const ANALYSIS_KEY = 'mm_analysis'
 
@@ -82,8 +87,36 @@ function groupByDay(entries: LogEntry[]) {
   return groups
 }
 
+/** Always read from localStorage — never trust React state alone before writes (avoids wiping data if state hasn't hydrated yet). */
+function readLogFromStorage(): LogEntry[] {
+  if (typeof window === 'undefined') return []
+  try {
+    const raw = localStorage.getItem(LOG_KEY)
+    if (!raw) return []
+    const p = JSON.parse(raw)
+    return Array.isArray(p) ? p : []
+  } catch {
+    return []
+  }
+}
+
+type ArchiveBlock = { week: string; archivedAt: string; entries: LogEntry[] }
+
+function readArchiveFromStorage(): ArchiveBlock[] {
+  if (typeof window === 'undefined') return []
+  try {
+    const raw = localStorage.getItem(ARCHIVE_KEY)
+    if (!raw) return []
+    const p = JSON.parse(raw)
+    return Array.isArray(p) ? p : []
+  } catch {
+    return []
+  }
+}
+
 export default function MemoryMachine() {
   const [stable, setStable] = useState(DEFAULT_STABLE)
+  /* Empty until useEffect loads from localStorage — matches SSR HTML and avoids hydration mismatch */
   const [log, setLog] = useState<LogEntry[]>([])
   const [input, setInput] = useState('')
   const [area, setArea] = useState('general')
@@ -100,14 +133,19 @@ export default function MemoryMachine() {
   const [proposed, setProposed] = useState<any[]>([])
   const [projects, setProjects] = useState<any[]>([])
   const [dailyLogs, setDailyLogs] = useState<any[]>([])
-  const [taskSubView, setTaskSubView] = useState<'reconcile' | 'today' | 'done'>('reconcile')
-  const [taskFilter, setTaskFilter] = useState<'active' | 'waiting' | 'someday' | 'all'>('active')
+  const [taskSubView, setTaskSubView] = useState<'reconcile' | 'active' | 'done'>('reconcile')
+  const [taskFilter, setTaskFilter] = useState<'now' | 'soon' | 'later' | 'all'>('all')
+  const [taskProjectFilter, setTaskProjectFilter] = useState('')
   const [ollamaOk, setOllamaOk] = useState<boolean | null>(null)
   const [newTaskTitle, setNewTaskTitle] = useState('')
   const [newTaskProject, setNewTaskProject] = useState('')
   const [newTaskPriority, setNewTaskPriority] = useState('soon')
+  const [showProjectsModal, setShowProjectsModal] = useState(false)
+  const [editingProjectName, setEditingProjectName] = useState<string | null>(null)
+  const [editingProjectDraft, setEditingProjectDraft] = useState('')
+  const [newProjectInput, setNewProjectInput] = useState('')
 
-  const [archive, setArchive] = useState<Array<{ week: string; archivedAt: string; entries: LogEntry[] }>>([])
+  const [archive, setArchive] = useState<ArchiveBlock[]>([])
   const [analysisEntries, setAnalysisEntries] = useState<Array<{ id: string; savedAt: string; text: string }>>([])
   const [expandedWeeks, setExpandedWeeks] = useState<Set<string>>(new Set())
   const [expandedAnalyses, setExpandedAnalyses] = useState<Set<string>>(new Set())
@@ -118,29 +156,77 @@ export default function MemoryMachine() {
   const [domainEntries, setDomainEntries] = useState<DomainEntry[]>([])
 
   useEffect(() => {
-    const s = localStorage.getItem(STABLE_KEY)
-    const l = localStorage.getItem(LOG_KEY)
-    const a = localStorage.getItem(ARCHIVE_KEY)
-    const an = localStorage.getItem(ANALYSIS_KEY)
-    if (s) setStable(s)
-    if (l) setLog(JSON.parse(l))
-    if (a) setArchive(JSON.parse(a))
-    if (an) setAnalysisEntries(JSON.parse(an))
+    try {
+      const s = localStorage.getItem(STABLE_KEY)
+      if (s) setStable(s)
+    } catch { /* ignore */ }
+    try {
+      const l = localStorage.getItem(LOG_KEY)
+      if (l) {
+        const parsed = JSON.parse(l)
+        if (Array.isArray(parsed)) setLog(parsed)
+      }
+    } catch { /* ignore */ }
+    try {
+      const a = localStorage.getItem(ARCHIVE_KEY)
+      if (a) {
+        const parsed = JSON.parse(a)
+        if (Array.isArray(parsed)) setArchive(parsed)
+      }
+    } catch { /* ignore */ }
+    try {
+      const an = localStorage.getItem(ANALYSIS_KEY)
+      if (an) {
+        const parsed = JSON.parse(an)
+        if (Array.isArray(parsed)) setAnalysisEntries(parsed)
+      }
+    } catch { /* ignore */ }
     setTimeout(() => inputRef.current?.focus(), 100)
   }, [])
 
   async function loadTasks() {
-    const res = await fetch('/api/tasks')
-    const data = await res.json()
-    setTasks(data.tasks)
-    setProposed(data.proposed)
-    setProjects(data.projects)
-    setDailyLogs(data.dailyLogs)
+    try {
+      const res = await fetch('/api/tasks')
+      const data = await res.json()
+      setTasks(Array.isArray(data.tasks) ? data.tasks : [])
+      setProposed(Array.isArray(data.proposed) ? data.proposed : [])
+      setDailyLogs(Array.isArray(data.dailyLogs) ? data.dailyLogs : [])
+
+      // Projects: merge localStorage with any from API/tasks/proposed, persist
+      let list: string[] = []
+      if (typeof window !== 'undefined') {
+        const stored: string[] = (() => {
+          const s = localStorage.getItem(TASKS_PROJECTS_KEY)
+          if (!s) return []
+          try {
+            const p = JSON.parse(s)
+            return Array.isArray(p) ? p.filter((x: unknown) => typeof x === 'string') : []
+          } catch {
+            return []
+          }
+        })()
+        const names = new Set<string>(stored)
+        ;(data.projects || []).forEach((p: { name?: string }) => p.name && names.add(p.name))
+        ;(data.tasks || []).forEach((t: { project?: string }) => t.project && names.add(t.project))
+        ;(data.proposed || []).forEach((p: { project?: string }) => p.project && names.add(p.project))
+        list = Array.from(names).sort()
+        localStorage.setItem(TASKS_PROJECTS_KEY, JSON.stringify(list))
+      }
+      setProjects(list)
+    } catch {
+      setTasks([])
+      setProposed([])
+      setDailyLogs([])
+      setProjects([])
+    }
   }
 
   async function checkOllama() {
     try {
-      await fetch('http://localhost:11434/', { signal: AbortSignal.timeout(2000) })
+      const ctrl = new AbortController()
+      const t = setTimeout(() => ctrl.abort(), 2000)
+      await fetch('http://localhost:11434/', { signal: ctrl.signal })
+      clearTimeout(t)
       setOllamaOk(true)
     } catch {
       setOllamaOk(false)
@@ -151,6 +237,10 @@ export default function MemoryMachine() {
     if (view === 'tasks') {
       loadTasks()
       checkOllama()
+    } else {
+      setShowProjectsModal(false)
+      setEditingProjectName(null)
+      setEditingProjectDraft('')
     }
   }, [view])
 
@@ -232,7 +322,7 @@ export default function MemoryMachine() {
     }
     if (oldDomain) removeFromDomainLog(DOMAIN_KEYS[oldDomain], entry.id)
     const updated: LogEntry = { ...entry, domain: newDomain }
-    const newLog = log.map(e => e.id === entry.id ? updated : e)
+    const newLog = readLogFromStorage().map(e => e.id === entry.id ? updated : e)
     saveLog(newLog)
     distillAndAppendToDomainLog(DOMAIN_KEYS[newDomain], updated)
     setEditingTagEntryId(null)
@@ -243,7 +333,7 @@ export default function MemoryMachine() {
       removeFromDomainLog(DOMAIN_KEYS[entry.domain], entry.id)
     }
     const updated: LogEntry = { ...entry, domain: undefined }
-    const newLog = log.map(e => e.id === entry.id ? updated : e)
+    const newLog = readLogFromStorage().map(e => e.id === entry.id ? updated : e)
     saveLog(newLog)
     setEditingTagEntryId(null)
   }
@@ -257,8 +347,15 @@ export default function MemoryMachine() {
       area: area !== 'general' ? area : undefined,
       domain: domain ?? undefined,
     }
-    saveLog([entry, ...log])
+    saveLog([entry, ...readLogFromStorage()])
     if (domain) distillAndAppendToDomainLog(DOMAIN_KEYS[domain], entry)
+    let knownProjects: string[] = []
+    if (typeof window !== 'undefined') {
+      try {
+        const s = localStorage.getItem(TASKS_PROJECTS_KEY)
+        if (s) knownProjects = JSON.parse(s)
+      } catch { /* ignore */ }
+    }
     fetch('/api/ingest', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -266,6 +363,7 @@ export default function MemoryMachine() {
         id: entry.id,
         timestamp: entry.ts,
         content: entry.text,
+        knownProjects,
       }),
     }).catch(() => {})
     setInput('')
@@ -274,7 +372,7 @@ export default function MemoryMachine() {
   }
 
   function deleteEntry(id: string) {
-    saveLog(log.filter(e => e.id !== id))
+    saveLog(readLogFromStorage().filter(e => e.id !== id))
   }
 
   function buildExport() {
@@ -335,13 +433,13 @@ ${logMd}
     const weekStart = new Date(now)
     weekStart.setDate(now.getDate() - now.getDay())
     const weekStr = weekStart.toISOString().split('T')[0]
-    const block = {
+    const entries = readLogFromStorage()
+    const block: ArchiveBlock = {
       week: weekStr,
       archivedAt: now.toISOString(),
-      entries: [...log],
+      entries: [...entries],
     }
-    const existing = localStorage.getItem(ARCHIVE_KEY)
-    const arr: typeof archive = existing ? JSON.parse(existing) : []
+    const arr = readArchiveFromStorage()
     arr.unshift(block)
     localStorage.setItem(ARCHIVE_KEY, JSON.stringify(arr))
     setArchive(arr)
@@ -448,6 +546,59 @@ ${logMd}
     await loadTasks()
   }
 
+  function persistProjects(list: string[]) {
+    const sorted = [...list].sort()
+    if (typeof window !== 'undefined') {
+      localStorage.setItem(TASKS_PROJECTS_KEY, JSON.stringify(sorted))
+    }
+    setProjects(sorted)
+  }
+
+  function addProject() {
+    const name = newProjectInput.trim()
+    if (!name || projects.includes(name)) return
+    persistProjects([...projects, name])
+    setNewProjectInput('')
+  }
+
+  async function renameProject(oldName: string, newName: string) {
+    if (!newName.trim() || oldName === newName.trim()) {
+      setEditingProjectName(null)
+      setEditingProjectDraft('')
+      return
+    }
+    const trimmed = newName.trim()
+    if (projects.includes(trimmed) && trimmed !== oldName) {
+      setEditingProjectName(null)
+      setEditingProjectDraft('')
+      return
+    }
+    await fetch('/api/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'rename_project', oldName, newName: trimmed }),
+    })
+    const updated = projects.map(n => n === oldName ? trimmed : n)
+    persistProjects(updated)
+    if (taskProjectFilter === oldName) setTaskProjectFilter(trimmed)
+    setEditingProjectName(null)
+    setEditingProjectDraft('')
+    await loadTasks()
+  }
+
+  async function deleteProject(name: string) {
+    await fetch('/api/tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'clear_project', name }),
+    })
+    persistProjects(projects.filter(n => n !== name))
+    if (taskProjectFilter === name) setTaskProjectFilter('')
+    setEditingProjectName(null)
+    setEditingProjectDraft('')
+    await loadTasks()
+  }
+
   async function addQuickTask() {
     if (!newTaskTitle.trim()) return
     await fetch('/api/tasks', {
@@ -487,14 +638,33 @@ ${logMd}
     const raw = localStorage.getItem(DOMAIN_KEYS[d])
     if (!raw) return []
     const arr = JSON.parse(raw)
-    return [...arr].sort((a: DomainEntry, b: DomainEntry) => a.ts.localeCompare(b.ts))
+    return [...arr].sort((a: DomainEntry, b: DomainEntry) => b.ts.localeCompare(a.ts))
   }
 
+
+  async function distillExistingEntry(domainKey: string, entry: DomainEntry) {
+    updateDomainEntryInStorage(domainKey, entry.id, e => ({ ...e, distillationStatus: 'pending' }))
+    try {
+      const res = await fetch('/api/distill', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: entry.text }),
+      })
+      if (res.ok) {
+        const { distilled } = await res.json()
+        updateDomainEntryInStorage(domainKey, entry.id, e => ({ ...e, text: distilled, distillationStatus: 'done' }))
+      } else {
+        updateDomainEntryInStorage(domainKey, entry.id, e => ({ ...e, distillationStatus: 'failed' }))
+      }
+    } catch {
+      updateDomainEntryInStorage(domainKey, entry.id, e => ({ ...e, distillationStatus: 'failed' }))
+    }
+  }
 
   function copyDomainExport(d: Domain) {
     const entries = getDomainEntries(d)
     const label = d.charAt(0).toUpperCase() + d.slice(1)
-    const lines = entries.map((e: DomainEntry) =>
+    const lines = [...entries].reverse().map((e: DomainEntry) =>
       `${new Date(e.ts).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })} — ${e.text}`
     ).join('\n')
     const md = `## ${label} Context Log\nExported: ${new Date().toISOString()}\n\n---\n\n${lines}`
@@ -507,7 +677,7 @@ ${logMd}
     <div style={{
       minHeight: '100vh',
       background: '#0a0a0a',
-      color: '#e8e4dc',
+      color: '#ebe8e0',
       fontFamily: '"IBM Plex Mono", "Courier New", monospace',
       display: 'flex',
       flexDirection: 'column',
@@ -522,19 +692,19 @@ ${logMd}
         background: '#0d0d0d',
       }}>
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 12 }}>
-          <span style={{ fontSize: 13, fontWeight: 600, letterSpacing: '0.15em', color: '#c8b89a' }}>
+          <span style={{ fontSize: fz(13), fontWeight: 600, letterSpacing: '0.15em', color: '#c8b89a' }}>
             MEMORY MACHINE
           </span>
-          <span style={{ fontSize: 11, color: '#444', letterSpacing: '0.1em' }}>v2</span>
+          <span style={{ fontSize: fz(11), color: '#6e6e6e', letterSpacing: '0.1em' }}>v2</span>
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           {(['log', 'stable', 'export', 'domains', 'archive', 'analysis', 'tasks', 'help'] as const).map(v => (
             <button key={v} onClick={() => setView(v)} style={{
               background: view === v ? '#1a1a1a' : 'transparent',
               border: view === v ? '1px solid #333' : '1px solid transparent',
-              color: view === v ? '#e8e4dc' : '#555',
+              color: view === v ? '#e8e4dc' : '#818178',
               padding: '4px 12px',
-              fontSize: 11,
+              fontSize: fz(11),
               letterSpacing: '0.1em',
               cursor: 'pointer',
               borderRadius: 3,
@@ -546,12 +716,12 @@ ${logMd}
           {view === 'log' && (
             <>
               {(exportMessage || archiveMessage) && (
-                <span style={{ fontSize: 10, color: '#c8b89a', letterSpacing: '0.08em' }}>{exportMessage || archiveMessage}</span>
+                <span style={{ fontSize: fz(10), color: '#c8b89a', letterSpacing: '0.08em' }}>{exportMessage || archiveMessage}</span>
               )}
               <button onClick={handleExport} style={btnStyle('#c8b89a', '#0a0a0a')}>
                 Export log
               </button>
-              <button onClick={archiveAndClear} disabled={log.length === 0} style={btnStyle(log.length ? '#1a1a1a' : '#0d0d0d', log.length ? '#888' : '#333')}>
+              <button onClick={archiveAndClear} disabled={log.length === 0} style={btnStyle(log.length ? '#1a1a1a' : '#0d0d0d', log.length ? '#b0b0a8' : '#5c5c5c')}>
                 Archive & Clear
               </button>
             </>
@@ -572,9 +742,9 @@ ${logMd}
             style={{
               background: '#141414',
               border: '1px solid #2a2a2a',
-              color: '#888',
+              color: '#b0b0a8',
               padding: '8px 10px',
-              fontSize: 11,
+              fontSize: fz(11),
               letterSpacing: '0.08em',
               borderRadius: 3,
               cursor: 'pointer',
@@ -595,7 +765,7 @@ ${logMd}
               border: '1px solid #2a2a2a',
               color: '#e8e4dc',
               padding: '8px 14px',
-              fontSize: 13,
+              fontSize: fz(13),
               borderRadius: 3,
               outline: 'none',
               fontFamily: 'inherit',
@@ -607,9 +777,9 @@ ${logMd}
             style={{
               background: input.trim() ? '#c8b89a' : '#1a1a1a',
               border: 'none',
-              color: input.trim() ? '#0a0a0a' : '#333',
+              color: input.trim() ? '#0a0a0a' : '#5c5c5c',
               padding: '8px 16px',
-              fontSize: 11,
+              fontSize: fz(11),
               letterSpacing: '0.1em',
               cursor: input.trim() ? 'pointer' : 'default',
               borderRadius: 3,
@@ -628,9 +798,9 @@ ${logMd}
               style={{
                 background: domain === d ? '#c8b89a' : 'transparent',
                 border: domain === d ? '1px solid #c8b89a' : '1px solid #2a2a2a',
-                color: domain === d ? '#0a0a0a' : '#555',
+                color: domain === d ? '#0a0a0a' : '#818178',
                 padding: '4px 10px',
-                fontSize: 10,
+                fontSize: fz(10),
                 letterSpacing: '0.08em',
                 cursor: 'pointer',
                 borderRadius: 3,
@@ -642,7 +812,7 @@ ${logMd}
             </button>
           ))}
         </div>
-        <div style={{ marginTop: 6, fontSize: 10, color: '#333', letterSpacing: '0.08em' }}>
+        <div style={{ marginTop: 6, fontSize: fz(10), color: '#5c5c5c', letterSpacing: '0.08em' }}>
           {todayEntries.length} {todayEntries.length === 1 ? 'entry' : 'entries'} today
           {log.length > todayEntries.length && ` · ${log.length} total`}
         </div>
@@ -654,16 +824,16 @@ ${logMd}
         {view === 'log' && (
           <div>
             {log.length === 0 ? (
-              <div style={{ color: '#333', fontSize: 12, letterSpacing: '0.08em', paddingTop: 20 }}>
+              <div style={{ color: '#5c5c5c', fontSize: fz(12), letterSpacing: '0.08em', paddingTop: 20 }}>
                 no entries yet. start logging above.
               </div>
             ) : (
               Object.entries(groups).reverse().map(([day, entries]) => (
                 <div key={day} style={{ marginBottom: 32 }}>
                   <div style={{
-                    fontSize: 10,
+                    fontSize: fz(10),
                     letterSpacing: '0.15em',
-                    color: '#555',
+                    color: '#818178',
                     textTransform: 'uppercase',
                     marginBottom: 12,
                     paddingBottom: 6,
@@ -671,7 +841,7 @@ ${logMd}
                   }}>
                     {new Date(day).toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' })}
                   </div>
-                  {entries.map(entry => (
+                  {[...entries].reverse().map(entry => (
                     <div key={entry.id} style={{
                       marginBottom: 8,
                       padding: '8px 0',
@@ -682,7 +852,7 @@ ${logMd}
                         gap: 12,
                         alignItems: 'flex-start',
                       }}>
-                        <span style={{ fontSize: 10, color: '#444', whiteSpace: 'nowrap', paddingTop: 2, minWidth: 80 }}>
+                        <span style={{ fontSize: fz(10), color: '#6e6e6e', whiteSpace: 'nowrap', paddingTop: 2, minWidth: 80 }}>
                           {new Date(entry.ts).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}
                         </span>
                         <div style={{ minWidth: 55, paddingTop: 2 }}>
@@ -695,9 +865,9 @@ ${logMd}
                                   style={{
                                     background: (entry.domain || entry.area) === d ? '#c8b89a' : '#1a1a1a',
                                     border: '1px solid #333',
-                                    color: (entry.domain || entry.area) === d ? '#0a0a0a' : '#666',
+                                    color: (entry.domain || entry.area) === d ? '#0a0a0a' : '#95958c',
                                     padding: '2px 6px',
-                                    fontSize: 9,
+                                    fontSize: fz(9),
                                     letterSpacing: '0.05em',
                                     cursor: 'pointer',
                                     borderRadius: 2,
@@ -713,8 +883,8 @@ ${logMd}
                                 style={{
                                   background: 'none',
                                   border: 'none',
-                                  color: '#444',
-                                  fontSize: 9,
+                                  color: '#6e6e6e',
+                                  fontSize: fz(9),
                                   cursor: 'pointer',
                                   fontFamily: 'inherit',
                                 }}
@@ -735,7 +905,7 @@ ${logMd}
                             >
                               {(entry.domain || entry.area) ? (
                                 <span style={{
-                                  fontSize: 9,
+                                  fontSize: fz(9),
                                   letterSpacing: '0.1em',
                                   color: '#c8b89a',
                                   textTransform: 'uppercase',
@@ -744,8 +914,8 @@ ${logMd}
                                 </span>
                               ) : (
                                 <span style={{
-                                  fontSize: 9,
-                                  color: '#333',
+                                  fontSize: fz(9),
+                                  color: '#5c5c5c',
                                   letterSpacing: '0.05em',
                                 }}>
                                   + tag
@@ -754,7 +924,7 @@ ${logMd}
                             </button>
                           )}
                         </div>
-                        <span style={{ flex: 1, fontSize: 13, lineHeight: 1.5, color: '#d4cfc7' }}>
+                        <span style={{ flex: 1, fontSize: fz(13), lineHeight: 1.5, color: '#e2ddd4' }}>
                           {entry.text}
                         </span>
                         <button
@@ -762,9 +932,9 @@ ${logMd}
                           style={{
                             background: 'none',
                             border: 'none',
-                            color: '#333',
+                            color: '#5c5c5c',
                             cursor: 'pointer',
-                            fontSize: 14,
+                            fontSize: fz(14),
                             padding: '0 4px',
                             lineHeight: 1,
                           }}
@@ -782,9 +952,9 @@ ${logMd}
               <button onClick={clearLog} style={{
                 background: 'none',
                 border: '1px solid #2a2a2a',
-                color: '#444',
+                color: '#6e6e6e',
                 padding: '6px 14px',
-                fontSize: 10,
+                fontSize: fz(10),
                 letterSpacing: '0.1em',
                 cursor: 'pointer',
                 borderRadius: 3,
@@ -801,21 +971,21 @@ ${logMd}
         {view === 'stable' && (
           <div>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-              <span style={{ fontSize: 10, color: '#555', letterSpacing: '0.1em', textTransform: 'uppercase' }}>
+              <span style={{ fontSize: fz(10), color: '#818178', letterSpacing: '0.1em', textTransform: 'uppercase' }}>
                 AI_CONTEXT_STABLE.md
               </span>
               <div style={{ display: 'flex', gap: 8 }}>
                 {editingStable ? (
                   <>
                     <button onClick={() => { saveStable(stableDraft); setEditingStable(false) }} style={btnStyle('#c8b89a', '#0a0a0a')}>save</button>
-                    <button onClick={() => setEditingStable(false)} style={btnStyle('#1a1a1a', '#888')}>cancel</button>
+                    <button onClick={() => setEditingStable(false)} style={btnStyle('#1a1a1a', '#b0b0a8')}>cancel</button>
                   </>
                 ) : (
                   <>
-                    <button onClick={copyStable} style={btnStyle('#1a1a1a', copied ? '#c8b89a' : '#888')}>
+                    <button onClick={copyStable} style={btnStyle('#1a1a1a', copied ? '#c8b89a' : '#b0b0a8')}>
                       {copied ? 'copied!' : 'copy'}
                     </button>
-                    <button onClick={() => { setStableDraft(stable); setEditingStable(true) }} style={btnStyle('#1a1a1a', '#888')}>edit</button>
+                    <button onClick={() => { setStableDraft(stable); setEditingStable(true) }} style={btnStyle('#1a1a1a', '#b0b0a8')}>edit</button>
                   </>
                 )}
               </div>
@@ -831,7 +1001,7 @@ ${logMd}
                   border: '1px solid #2a2a2a',
                   color: '#e8e4dc',
                   padding: 16,
-                  fontSize: 12,
+                  fontSize: fz(12),
                   fontFamily: 'inherit',
                   lineHeight: 1.7,
                   borderRadius: 3,
@@ -845,7 +1015,7 @@ ${logMd}
                 background: '#0d0d0d',
                 border: '1px solid #1a1a1a',
                 padding: 20,
-                fontSize: 12,
+                fontSize: fz(12),
                 lineHeight: 1.7,
                 borderRadius: 3,
                 whiteSpace: 'pre-wrap',
@@ -861,7 +1031,7 @@ ${logMd}
         {view === 'export' && (
           <div>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-              <span style={{ fontSize: 10, color: '#555', letterSpacing: '0.1em', textTransform: 'uppercase' }}>
+              <span style={{ fontSize: fz(10), color: '#818178', letterSpacing: '0.1em', textTransform: 'uppercase' }}>
                 weekly synthesis export
               </span>
               <button onClick={copyExport} style={btnStyle('#c8b89a', '#0a0a0a')}>
@@ -873,29 +1043,29 @@ ${logMd}
               border: '1px solid #1a1a1a',
               borderRadius: 3,
               padding: 20,
-              fontSize: 11,
-              color: '#666',
+              fontSize: fz(11),
+              color: '#95958c',
               lineHeight: 1.8,
               marginBottom: 16,
             }}>
-              <div style={{ color: '#888', marginBottom: 8, fontSize: 12 }}>How to use this:</div>
+              <div style={{ color: '#b0b0a8', marginBottom: 8, fontSize: fz(12) }}>How to use this:</div>
               <div>1. Click "copy all" above</div>
               <div>2. Open claude.ai (uses your subscription, not the API)</div>
               <div>3. Paste and send</div>
               <div>4. Copy the new AI_CONTEXT_STABLE.md back into the STABLE tab</div>
               <div>5. Use Archive &amp; Clear (Log tab) to seal this week</div>
-              <div style={{ color: '#c8b89a', marginTop: 8, fontSize: 10 }}>After pasting this into Claude and receiving your refresh, use Archive &amp; Clear to seal this week.</div>
+              <div style={{ color: '#c8b89a', marginTop: 8, fontSize: fz(10) }}>After pasting this into Claude and receiving your refresh, use Archive &amp; Clear to seal this week.</div>
             </div>
             <pre style={{
               background: '#0d0d0d',
               border: '1px solid #1a1a1a',
               padding: 20,
-              fontSize: 11,
+              fontSize: fz(11),
               lineHeight: 1.7,
               borderRadius: 3,
               whiteSpace: 'pre-wrap',
               wordBreak: 'break-word',
-              color: '#555',
+              color: '#818178',
               maxHeight: '60vh',
               overflow: 'auto',
             }}>
@@ -914,8 +1084,8 @@ ${logMd}
                   style={{
                     background: domainView === d ? '#1a1a1a' : 'transparent',
                     border: domainView === d ? '1px solid #333' : '1px solid transparent',
-                    color: domainView === d ? '#e8e4dc' : '#555',
-                    padding: '4px 12px', fontSize: 11, letterSpacing: '0.1em',
+                    color: domainView === d ? '#e8e4dc' : '#818178',
+                    padding: '4px 12px', fontSize: fz(11), letterSpacing: '0.1em',
                     cursor: 'pointer', borderRadius: 3, textTransform: 'capitalize',
                     fontFamily: 'inherit',
                   }}>
@@ -924,7 +1094,7 @@ ${logMd}
               ))}
             </div>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-              <span style={{ fontSize: 10, color: '#555', letterSpacing: '0.1em', textTransform: 'uppercase' }}>
+              <span style={{ fontSize: fz(10), color: '#818178', letterSpacing: '0.1em', textTransform: 'uppercase' }}>
                 {domainView} domain log
               </span>
               <button onClick={() => copyDomainExport(domainView)} style={btnStyle('#c8b89a', '#0a0a0a')}>
@@ -932,7 +1102,7 @@ ${logMd}
               </button>
             </div>
             {domainEntries.length === 0 ? (
-              <div style={{ color: '#333', fontSize: 12, letterSpacing: '0.08em' }}>
+              <div style={{ color: '#5c5c5c', fontSize: fz(12), letterSpacing: '0.08em' }}>
                 no entries tagged to {domainView} yet.
               </div>
             ) : (
@@ -941,23 +1111,47 @@ ${logMd}
                   padding: '8px 0',
                   borderBottom: '1px solid #141414',
                   lineHeight: 1.5,
+                  display: 'flex',
+                  gap: 8,
+                  alignItems: 'flex-start',
                 }}>
-                  <span style={{ fontSize: 10, color: '#444', marginRight: 12 }}>
+                  <span style={{ fontSize: fz(10), color: '#6e6e6e', marginRight: 4, flexShrink: 0 }}>
                     {new Date(e.ts).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })} —{' '}
                   </span>
-                  {e.distillationStatus === 'pending' ? (
-                    <span style={{ fontSize: 13, color: '#555', fontStyle: 'italic' }}>
-                      Distilling…
-                    </span>
-                  ) : e.distillationStatus === 'failed' ? (
-                    <span>
-                      <span style={{ fontSize: 13, color: '#888' }}>{e.text}</span>
-                      <span style={{ fontSize: 9, color: '#555', marginLeft: 8 }}>(distillation failed)</span>
-                    </span>
-                  ) : (
-                    <span style={{ fontSize: 13, color: '#d4cfc7', whiteSpace: 'pre-wrap' }}>
-                      {e.text}
-                    </span>
+                  <span style={{ flex: 1, minWidth: 0 }}>
+                    {e.distillationStatus === 'pending' ? (
+                      <span style={{ fontSize: fz(13), color: '#818178', fontStyle: 'italic' }}>
+                        Distilling…
+                      </span>
+                    ) : e.distillationStatus === 'failed' ? (
+                      <span>
+                        <span style={{ fontSize: fz(13), color: '#b0b0a8' }}>{e.text}</span>
+                        <span style={{ fontSize: fz(9), color: '#818178', marginLeft: 8 }}>(distillation failed)</span>
+                      </span>
+                    ) : (
+                      <span style={{ fontSize: fz(13), color: '#e2ddd4', whiteSpace: 'pre-wrap' }}>
+                        {e.text}
+                      </span>
+                    )}
+                  </span>
+                  {(e.distillationStatus === 'failed' || e.distillationStatus === undefined) && (
+                    <button
+                      onClick={() => distillExistingEntry(DOMAIN_KEYS[domainView], e)}
+                      style={{
+                        background: '#1a1a1a',
+                        border: '1px solid #333',
+                        color: '#b0b0a8',
+                        padding: '2px 8px',
+                        fontSize: fz(9),
+                        letterSpacing: '0.05em',
+                        cursor: 'pointer',
+                        borderRadius: 2,
+                        fontFamily: 'inherit',
+                        flexShrink: 0,
+                      }}
+                    >
+                      Distil
+                    </button>
                   )}
                 </div>
               ))
@@ -967,11 +1161,11 @@ ${logMd}
 
         {view === 'archive' && (
           <div>
-            <div style={{ fontSize: 10, color: '#555', letterSpacing: '0.12em', textTransform: 'uppercase', marginBottom: 20 }}>
+            <div style={{ fontSize: fz(10), color: '#818178', letterSpacing: '0.12em', textTransform: 'uppercase', marginBottom: 20 }}>
               weekly archive
             </div>
             {archive.length === 0 ? (
-              <div style={{ color: '#333', fontSize: 12, letterSpacing: '0.08em' }}>
+              <div style={{ color: '#5c5c5c', fontSize: fz(12), letterSpacing: '0.08em' }}>
                 no archived weeks yet.
               </div>
             ) : (
@@ -985,7 +1179,7 @@ ${logMd}
                         background: 'none',
                         border: 'none',
                         color: '#c8b89a',
-                        fontSize: 12,
+                        fontSize: fz(12),
                         letterSpacing: '0.08em',
                         cursor: 'pointer',
                         fontFamily: 'inherit',
@@ -1006,13 +1200,13 @@ ${logMd}
                       }}>
                         {Object.entries(groupByDay([...block.entries].reverse())).reverse().map(([day, entries]) => (
                           <div key={day} style={{ marginBottom: 16 }}>
-                            <div style={{ fontSize: 10, color: '#555', letterSpacing: '0.1em', marginBottom: 8 }}>
+                            <div style={{ fontSize: fz(10), color: '#818178', letterSpacing: '0.1em', marginBottom: 8 }}>
                               {new Date(day).toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' })}
                             </div>
                             {entries.map((e: LogEntry) => (
                               <div key={e.id} style={{
-                                fontSize: 12,
-                                color: '#888',
+                                fontSize: fz(12),
+                                color: '#b0b0a8',
                                 marginBottom: 6,
                                 paddingLeft: 12,
                                 borderLeft: '1px solid #222',
@@ -1034,10 +1228,10 @@ ${logMd}
         {view === 'analysis' && (
           <div>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-              <span style={{ fontSize: 10, color: '#555', letterSpacing: '0.1em', textTransform: 'uppercase' }}>
+              <span style={{ fontSize: fz(10), color: '#818178', letterSpacing: '0.1em', textTransform: 'uppercase' }}>
                 weekly analysis log
               </span>
-              <button onClick={copyAllAnalyses} style={btnStyle('#1a1a1a', copied ? '#c8b89a' : '#888')}>
+              <button onClick={copyAllAnalyses} style={btnStyle('#1a1a1a', copied ? '#c8b89a' : '#b0b0a8')}>
                 {copied ? '✓ copied' : 'Copy All Analyses'}
               </button>
             </div>
@@ -1053,7 +1247,7 @@ ${logMd}
                   border: '1px solid #2a2a2a',
                   color: '#e8e4dc',
                   padding: 14,
-                  fontSize: 12,
+                  fontSize: fz(12),
                   fontFamily: 'inherit',
                   lineHeight: 1.6,
                   borderRadius: 3,
@@ -1063,14 +1257,14 @@ ${logMd}
                 }}
               />
               <button onClick={saveAnalysis} disabled={!analysisDraft.trim()} style={{
-                ...btnStyle(analysisDraft.trim() ? '#c8b89a' : '#1a1a1a', analysisDraft.trim() ? '#0a0a0a' : '#333'),
+                ...btnStyle(analysisDraft.trim() ? '#c8b89a' : '#1a1a1a', analysisDraft.trim() ? '#0a0a0a' : '#5c5c5c'),
                 marginTop: 8,
               }}>
                 Save Analysis
               </button>
             </div>
             {analysisEntries.length === 0 ? (
-              <div style={{ color: '#333', fontSize: 12, letterSpacing: '0.08em' }}>
+              <div style={{ color: '#5c5c5c', fontSize: fz(12), letterSpacing: '0.08em' }}>
                 no analysis entries yet. Paste your weekly summary and hit Save.
               </div>
             ) : (
@@ -1084,7 +1278,7 @@ ${logMd}
                         background: 'none',
                         border: 'none',
                         color: '#c8b89a',
-                        fontSize: 12,
+                        fontSize: fz(12),
                         letterSpacing: '0.08em',
                         cursor: 'pointer',
                         fontFamily: 'inherit',
@@ -1100,12 +1294,12 @@ ${logMd}
                         background: '#0d0d0d',
                         border: '1px solid #1a1a1a',
                         padding: 16,
-                        fontSize: 11,
+                        fontSize: fz(11),
                         lineHeight: 1.6,
                         borderRadius: 3,
                         whiteSpace: 'pre-wrap',
                         wordBreak: 'break-word',
-                        color: '#888',
+                        color: '#b0b0a8',
                         marginTop: 4,
                       }}>
                         {e.text}
@@ -1124,33 +1318,88 @@ ${logMd}
               <div style={{
                 background: '#1a1200', border: '1px solid #3a2800',
                 color: '#c8a050', padding: '8px 14px', borderRadius: 3,
-                fontSize: 11, letterSpacing: '0.08em', marginBottom: 16,
+                fontSize: fz(11), letterSpacing: '0.08em', marginBottom: 16,
               }}>
                 local ai unavailable — manual task entry still works
               </div>
             )}
 
-            <div style={{ display: 'flex', gap: 6, marginBottom: 20 }}>
-              {(['reconcile', 'today', 'done'] as const).map(sv => (
+            <div style={{ display: 'flex', gap: 8, marginBottom: 20, alignItems: 'center', flexWrap: 'wrap' }}>
+              {(['reconcile', 'active', 'done'] as const).map(sv => (
                 <button key={sv} onClick={() => setTaskSubView(sv)} style={{
                   background: taskSubView === sv ? '#1a1a1a' : 'transparent',
                   border: taskSubView === sv ? '1px solid #333' : '1px solid transparent',
-                  color: taskSubView === sv ? '#e8e4dc' : '#555',
-                  padding: '4px 12px', fontSize: 11, letterSpacing: '0.1em',
+                  color: taskSubView === sv ? '#e8e4dc' : '#818178',
+                  padding: '4px 12px', fontSize: fz(11), letterSpacing: '0.1em',
                   cursor: 'pointer', borderRadius: 3, textTransform: 'uppercase',
                   fontFamily: 'inherit',
                 }}>
-                  {sv}
+                  {sv.charAt(0).toUpperCase() + sv.slice(1)}
                   {sv === 'reconcile' && proposed.length > 0 && (
                     <span style={{
                       marginLeft: 6, background: '#c8b89a', color: '#0a0a0a',
-                      borderRadius: 8, padding: '0 5px', fontSize: 9, fontWeight: 700,
+                      borderRadius: 8, padding: '0 5px', fontSize: fz(9), fontWeight: 700,
                     }}>
                       {proposed.length}
                     </span>
                   )}
                 </button>
               ))}
+              {taskSubView === 'active' && (
+                <>
+                  <span style={{ width: 1, height: 16, background: '#5c5c5c', marginLeft: 4 }} />
+                  <select
+                    value={taskProjectFilter}
+                    onChange={e => setTaskProjectFilter(e.target.value)}
+                    style={{
+                      background: taskProjectFilter ? '#1a1a1a' : '#141414',
+                      border: '1px solid #333',
+                      color: taskProjectFilter ? '#e8e4dc' : '#95958c',
+                      padding: '4px 10px',
+                      fontSize: fz(10),
+                      borderRadius: 3,
+                      cursor: 'pointer',
+                      fontFamily: 'inherit',
+                    }}
+                  >
+                    <option value="">All projects</option>
+                    {projects.map((name) => (
+                      <option key={name} value={name}>{name}</option>
+                    ))}
+                  </select>
+                  {taskProjectFilter && (
+                    <button
+                      onClick={() => setTaskProjectFilter('')}
+                      style={{
+                        background: 'none',
+                        border: 'none',
+                        color: '#818178',
+                        fontSize: fz(10),
+                        cursor: 'pointer',
+                        fontFamily: 'inherit',
+                      }}
+                    >
+                      Reset
+                    </button>
+                  )}
+                </>
+              )}
+              <button
+                onClick={() => setShowProjectsModal(true)}
+                style={{
+                  background: 'none',
+                  border: '1px solid #333',
+                  color: '#95958c',
+                  padding: '4px 10px',
+                  fontSize: fz(10),
+                  cursor: 'pointer',
+                  borderRadius: 3,
+                  fontFamily: 'inherit',
+                  marginLeft: 4,
+                }}
+              >
+                Edit Projects
+              </button>
             </div>
 
             <div style={{
@@ -1164,7 +1413,7 @@ ${logMd}
                 placeholder="add task..."
                 style={{
                   flex: 1, background: '#141414', border: '1px solid #2a2a2a',
-                  color: '#e8e4dc', padding: '7px 12px', fontSize: 12,
+                  color: '#e8e4dc', padding: '7px 12px', fontSize: fz(12),
                   borderRadius: 3, outline: 'none', fontFamily: 'inherit',
                 }}
               />
@@ -1172,22 +1421,22 @@ ${logMd}
                 value={newTaskProject}
                 onChange={e => setNewTaskProject(e.target.value)}
                 style={{
-                  background: '#141414', border: '1px solid #2a2a2a', color: '#888',
-                  padding: '7px 10px', fontSize: 11, borderRadius: 3, cursor: 'pointer',
+                  background: '#141414', border: '1px solid #2a2a2a', color: '#b0b0a8',
+                  padding: '7px 10px', fontSize: fz(11), borderRadius: 3, cursor: 'pointer',
                   fontFamily: 'inherit',
                 }}
               >
                 <option value="">no project</option>
-                {projects.map((p: any) => (
-                  <option key={p.id} value={p.name}>{p.name}</option>
+                {projects.map((name) => (
+                  <option key={name} value={name}>{name}</option>
                 ))}
               </select>
               <select
                 value={newTaskPriority}
                 onChange={e => setNewTaskPriority(e.target.value)}
                 style={{
-                  background: '#141414', border: '1px solid #2a2a2a', color: '#888',
-                  padding: '7px 10px', fontSize: 11, borderRadius: 3, cursor: 'pointer',
+                  background: '#141414', border: '1px solid #2a2a2a', color: '#b0b0a8',
+                  padding: '7px 10px', fontSize: fz(11), borderRadius: 3, cursor: 'pointer',
                   fontFamily: 'inherit',
                 }}
               >
@@ -1197,8 +1446,8 @@ ${logMd}
               </select>
               <button onClick={addQuickTask} disabled={!newTaskTitle.trim()} style={{
                 background: newTaskTitle.trim() ? '#c8b89a' : '#1a1a1a',
-                border: 'none', color: newTaskTitle.trim() ? '#0a0a0a' : '#333',
-                padding: '7px 14px', fontSize: 11, letterSpacing: '0.1em',
+                border: 'none', color: newTaskTitle.trim() ? '#0a0a0a' : '#5c5c5c',
+                padding: '7px 14px', fontSize: fz(11), letterSpacing: '0.1em',
                 cursor: newTaskTitle.trim() ? 'pointer' : 'default',
                 borderRadius: 3, fontFamily: 'inherit', fontWeight: 600,
                 textTransform: 'uppercase',
@@ -1210,13 +1459,13 @@ ${logMd}
             {taskSubView === 'reconcile' && (
               <div>
                 {proposed.length === 0 ? (
-                  <div style={{ color: '#333', fontSize: 12, letterSpacing: '0.08em' }}>
+                  <div style={{ color: '#5c5c5c', fontSize: fz(12), letterSpacing: '0.08em' }}>
                     no proposed tasks. log an entry to extract tasks automatically.
                   </div>
                 ) : (
                   <div>
                     <div style={{
-                      fontSize: 10, color: '#555', letterSpacing: '0.12em',
+                      fontSize: fz(10), color: '#818178', letterSpacing: '0.12em',
                       textTransform: 'uppercase', marginBottom: 12,
                     }}>
                       {proposed.length} proposed {proposed.length === 1 ? 'task' : 'tasks'} from your log
@@ -1226,27 +1475,27 @@ ${logMd}
                         background: '#0d0d0d', border: '1px solid #222',
                         borderRadius: 3, padding: '12px 14px', marginBottom: 8,
                       }}>
-                        <div style={{ fontSize: 13, color: '#e8e4dc', marginBottom: 8 }}>{p.title}</div>
+                        <div style={{ fontSize: fz(13), color: '#e8e4dc', marginBottom: 8 }}>{p.title}</div>
                         <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
                           {p.project && (
                             <span style={{
-                              fontSize: 9, letterSpacing: '0.1em', color: '#c8b89a',
+                              fontSize: fz(9), letterSpacing: '0.1em', color: '#c8b89a',
                               textTransform: 'uppercase',
                             }}>
                               {p.project}
                             </span>
                           )}
-                          <span style={{ fontSize: 9, color: '#444', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+                          <span style={{ fontSize: fz(9), color: '#6e6e6e', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
                             {p.priority} · {p.status}
                           </span>
                           <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
                             <button onClick={() => approveTask(p)} style={btnStyle('#c8b89a', '#0a0a0a')}>add</button>
-                            <button onClick={() => dismissTask(p.id)} style={btnStyle('#1a1a1a', '#666')}>dismiss</button>
+                            <button onClick={() => dismissTask(p.id)} style={btnStyle('#1a1a1a', '#95958c')}>dismiss</button>
                           </div>
                         </div>
                         {p.source_text && (
                           <div style={{
-                            marginTop: 8, fontSize: 10, color: '#333',
+                            marginTop: 8, fontSize: fz(10), color: '#5c5c5c',
                             borderTop: '1px solid #1a1a1a', paddingTop: 6,
                             fontStyle: 'italic',
                           }}>
@@ -1264,7 +1513,7 @@ ${logMd}
                       </button>
                       <button
                         onClick={async () => { for (const p of proposed) await dismissTask(p.id) }}
-                        style={btnStyle('#1a1a1a', '#666')}
+                        style={btnStyle('#1a1a1a', '#95958c')}
                       >
                         dismiss all
                       </button>
@@ -1274,15 +1523,15 @@ ${logMd}
               </div>
             )}
 
-            {taskSubView === 'today' && (
+            {taskSubView === 'active' && (
               <div>
                 <div style={{ display: 'flex', gap: 6, marginBottom: 16 }}>
-                  {(['active', 'waiting', 'someday', 'all'] as const).map(f => (
+                  {(['now', 'soon', 'later', 'all'] as const).map(f => (
                     <button key={f} onClick={() => setTaskFilter(f)} style={{
                       background: taskFilter === f ? '#1a1a1a' : 'transparent',
                       border: taskFilter === f ? '1px solid #333' : '1px solid transparent',
-                      color: taskFilter === f ? '#e8e4dc' : '#444',
-                      padding: '3px 10px', fontSize: 10, letterSpacing: '0.1em',
+                      color: taskFilter === f ? '#e8e4dc' : '#6e6e6e',
+                      padding: '3px 10px', fontSize: fz(10), letterSpacing: '0.1em',
                       cursor: 'pointer', borderRadius: 3, textTransform: 'uppercase',
                       fontFamily: 'inherit',
                     }}>{f}</button>
@@ -1293,17 +1542,18 @@ ${logMd}
                   const filtered = tasks.filter((t: any) =>
                     t.priority === priority &&
                     t.status !== 'done' && t.status !== 'archived' &&
-                    (taskFilter === 'all' || t.status === taskFilter)
+                    (taskFilter === 'all' || t.priority === taskFilter) &&
+                    (taskProjectFilter === '' || t.project === taskProjectFilter)
                   )
                   if (filtered.length === 0) return null
                   return (
                     <div key={priority} style={{ marginBottom: 24 }}>
                       <div style={{
-                        fontSize: 10, color: '#555', letterSpacing: '0.15em',
+                        fontSize: fz(10), color: '#818178', letterSpacing: '0.15em',
                         textTransform: 'uppercase', marginBottom: 10,
                         paddingBottom: 6, borderBottom: '1px solid #1a1a1a',
                       }}>
-                        {priority}
+                        {priority === 'now' ? 'Now' : priority === 'soon' ? 'Soon' : 'Later'}
                       </div>
                       {filtered.map((t: any) => (
                         <div key={t.id} style={{
@@ -1320,25 +1570,40 @@ ${logMd}
                             }}
                           />
                           <div style={{ flex: 1 }}>
-                            <div style={{ fontSize: 13, color: '#d4cfc7' }}>{t.title}</div>
+                            <div style={{ fontSize: fz(13), color: '#e2ddd4' }}>{t.title}</div>
                             {t.project && (
-                              <div style={{ fontSize: 10, color: '#c8b89a', letterSpacing: '0.08em', marginTop: 2 }}>
+                              <div style={{ fontSize: fz(10), color: '#c8b89a', letterSpacing: '0.08em', marginTop: 2 }}>
                                 {t.project}
                               </div>
                             )}
                           </div>
                           <select
-                            value={t.status}
-                            onChange={e => updateTask(t.id, { status: e.target.value })}
+                            value={t.project || ''}
+                            onChange={e => updateTask(t.id, { project: e.target.value })}
                             style={{
                               background: '#141414', border: '1px solid #222',
-                              color: '#555', fontSize: 10, padding: '2px 6px',
+                              color: t.project ? '#b0b0a8' : '#818178',
+                              fontSize: fz(10), padding: '2px 6px', minWidth: 90,
                               borderRadius: 3, cursor: 'pointer', fontFamily: 'inherit',
                             }}
                           >
-                            <option value="active">active</option>
-                            <option value="waiting">waiting</option>
-                            <option value="someday">someday</option>
+                            <option value="">No project</option>
+                            {projects.map((name) => (
+                              <option key={name} value={name}>{name}</option>
+                            ))}
+                          </select>
+                          <select
+                            value={t.priority}
+                            onChange={e => updateTask(t.id, { priority: e.target.value })}
+                            style={{
+                              background: '#141414', border: '1px solid #222',
+                              color: '#818178', fontSize: fz(10), padding: '2px 6px',
+                              borderRadius: 3, cursor: 'pointer', fontFamily: 'inherit',
+                            }}
+                          >
+                            <option value="now">Now</option>
+                            <option value="soon">Soon</option>
+                            <option value="later">Later</option>
                           </select>
                         </div>
                       ))}
@@ -1346,9 +1611,14 @@ ${logMd}
                   )
                 })}
 
-                {tasks.filter((t: any) => t.status !== 'done' && t.status !== 'archived').length === 0 && (
-                  <div style={{ color: '#333', fontSize: 12, letterSpacing: '0.08em' }}>
-                    no active tasks. add one above or approve from reconcile.
+                {tasks.filter((t: any) =>
+                  t.status !== 'done' && t.status !== 'archived' &&
+                  (taskProjectFilter === '' || t.project === taskProjectFilter)
+                ).length === 0 && (
+                  <div style={{ color: '#5c5c5c', fontSize: fz(12), letterSpacing: '0.08em' }}>
+                    {taskProjectFilter
+                      ? `no tasks in ${taskProjectFilter}.`
+                      : 'no active tasks. add one above or approve from reconcile.'}
                   </div>
                 )}
               </div>
@@ -1357,12 +1627,12 @@ ${logMd}
             {taskSubView === 'done' && (
               <div>
                 <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 16 }}>
-                  <button onClick={copyDoneLog} style={btnStyle('#1a1a1a', copied ? '#c8b89a' : '#888')}>
+                  <button onClick={copyDoneLog} style={btnStyle('#1a1a1a', copied ? '#c8b89a' : '#b0b0a8')}>
                     {copied ? '✓ copied' : "copy today's log"}
                   </button>
                 </div>
                 {dailyLogs.length === 0 ? (
-                  <div style={{ color: '#333', fontSize: 12, letterSpacing: '0.08em' }}>
+                  <div style={{ color: '#5c5c5c', fontSize: fz(12), letterSpacing: '0.08em' }}>
                     no completed tasks yet.
                   </div>
                 ) : (
@@ -1375,7 +1645,7 @@ ${logMd}
                   ).map(([date, entries]) => (
                     <div key={date} style={{ marginBottom: 24 }}>
                       <div style={{
-                        fontSize: 10, color: '#555', letterSpacing: '0.15em',
+                        fontSize: fz(10), color: '#818178', letterSpacing: '0.15em',
                         textTransform: 'uppercase', marginBottom: 10,
                         paddingBottom: 6, borderBottom: '1px solid #1a1a1a',
                       }}>
@@ -1388,11 +1658,11 @@ ${logMd}
                           display: 'flex', gap: 10, padding: '6px 0',
                           borderBottom: '1px solid #141414', alignItems: 'baseline',
                         }}>
-                          <span style={{ fontSize: 13, color: '#d4cfc7', flex: 1 }}>
+                          <span style={{ fontSize: fz(13), color: '#e2ddd4', flex: 1 }}>
                             {l.task_title}
                           </span>
                           {l.project && (
-                            <span style={{ fontSize: 10, color: '#c8b89a', letterSpacing: '0.08em' }}>
+                            <span style={{ fontSize: fz(10), color: '#c8b89a', letterSpacing: '0.08em' }}>
                               {l.project}
                             </span>
                           )}
@@ -1412,25 +1682,25 @@ ${logMd}
             border: '1px solid #1a1a1a',
             borderRadius: 3,
             padding: 24,
-            fontSize: 12,
+            fontSize: fz(12),
             lineHeight: 1.8,
             color: '#c8c4bc',
             fontFamily: 'inherit',
           }}>
-            <div style={{ fontSize: 14, fontWeight: 600, color: '#c8b89a', marginBottom: 20, letterSpacing: '0.05em' }}>
+            <div style={{ fontSize: fz(14), fontWeight: 600, color: '#c8b89a', marginBottom: 20, letterSpacing: '0.05em' }}>
               How to use Memory Machine
             </div>
             <div style={{ marginBottom: 20 }}>
-              <div style={{ fontSize: 11, color: '#888', marginBottom: 8, letterSpacing: '0.08em' }}>Daily (30 seconds)</div>
+              <div style={{ fontSize: fz(11), color: '#b0b0a8', marginBottom: 8, letterSpacing: '0.08em' }}>Daily (30 seconds)</div>
               <div>Log by exception only — decisions, completions, realisations, shifts in thinking. Not activity. If nothing significant happened, don&apos;t log.</div>
               <div style={{ marginTop: 6 }}>Tag the domain if relevant. If you forget, you can tag it after from the log.</div>
             </div>
             <div style={{ marginBottom: 20 }}>
-              <div style={{ fontSize: 11, color: '#888', marginBottom: 8, letterSpacing: '0.08em' }}>After useful AI sessions</div>
+              <div style={{ fontSize: fz(11), color: '#b0b0a8', marginBottom: 8, letterSpacing: '0.08em' }}>After useful AI sessions</div>
               <div>Ask the AI for a structured markdown summary of the conversation. Paste it as a log entry.</div>
             </div>
             <div style={{ marginBottom: 20 }}>
-              <div style={{ fontSize: 11, color: '#888', marginBottom: 8, letterSpacing: '0.08em' }}>Weekly</div>
+              <div style={{ fontSize: fz(11), color: '#b0b0a8', marginBottom: 8, letterSpacing: '0.08em' }}>Weekly</div>
               <div>1. Export tab → copy the full block</div>
               <div>2. Paste into Claude → receive refreshed stable doc + analysis</div>
               <div>3. Paste new stable doc back into Stable tab</div>
@@ -1439,19 +1709,148 @@ ${logMd}
               <div>6. Done — five minutes maximum</div>
             </div>
             <div style={{ marginBottom: 20 }}>
-              <div style={{ fontSize: 11, color: '#888', marginBottom: 8, letterSpacing: '0.08em' }}>Domain deep dive (ad hoc)</div>
+              <div style={{ fontSize: fz(11), color: '#b0b0a8', marginBottom: 8, letterSpacing: '0.08em' }}>Domain deep dive (ad hoc)</div>
               <div>Open the relevant domain tab → Copy Domain Export → paste into a new AI chat with your specific question.</div>
             </div>
             <div style={{ marginBottom: 20 }}>
-              <div style={{ fontSize: 11, color: '#888', marginBottom: 8, letterSpacing: '0.08em' }}>Quarterly</div>
+              <div style={{ fontSize: fz(11), color: '#b0b0a8', marginBottom: 8, letterSpacing: '0.08em' }}>Quarterly</div>
               <div>Analysis tab → Copy All Analyses → paste into Claude → ask for a meta-review. Trends, drift, progress over time.</div>
             </div>
-            <div style={{ borderTop: '1px solid #222', paddingTop: 16, fontSize: 11, color: '#555' }}>
+            <div style={{ borderTop: '1px solid #222', paddingTop: 16, fontSize: fz(11), color: '#818178' }}>
               If adding an entry takes more than 20 seconds, the system is too complicated.
             </div>
           </div>
         )}
       </div>
+
+      {view === 'tasks' && showProjectsModal && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0,0,0,0.6)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 1000,
+          }}
+          onClick={() => {
+            setShowProjectsModal(false)
+            setEditingProjectName(null)
+            setEditingProjectDraft('')
+          }}
+        >
+          <div
+            style={{
+              background: '#0d0d0d',
+              border: '1px solid #2a2a2a',
+              borderRadius: 3,
+              padding: 24,
+              minWidth: 320,
+              maxWidth: 420,
+            }}
+            onClick={e => e.stopPropagation()}
+          >
+            <div style={{ fontSize: fz(12), fontWeight: 600, color: '#c8b89a', marginBottom: 16, letterSpacing: '0.05em' }}>
+              Edit Projects
+            </div>
+            <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+              <input
+                value={newProjectInput}
+                onChange={e => setNewProjectInput(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') addProject() }}
+                placeholder="Add project..."
+                style={{
+                  flex: 1, background: '#141414', border: '1px solid #2a2a2a',
+                  color: '#e8e4dc', padding: '8px 12px', fontSize: fz(12),
+                  borderRadius: 3, outline: 'none', fontFamily: 'inherit',
+                }}
+              />
+              <button onClick={addProject} disabled={!newProjectInput.trim()} style={{
+                background: newProjectInput.trim() ? '#c8b89a' : '#1a1a1a',
+                border: 'none', color: newProjectInput.trim() ? '#0a0a0a' : '#5c5c5c',
+                padding: '8px 14px', fontSize: fz(11), cursor: newProjectInput.trim() ? 'pointer' : 'default',
+                borderRadius: 3, fontFamily: 'inherit',
+              }}>
+                Add
+              </button>
+            </div>
+            <div style={{ maxHeight: 240, overflowY: 'auto' }}>
+              {projects.length === 0 ? (
+                <div style={{ color: '#818178', fontSize: fz(12) }}>No projects yet. Add one above.</div>
+              ) : (
+                projects.map((name) => (
+                  <div
+                    key={name}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 8,
+                      padding: '8px 0',
+                      borderBottom: '1px solid #1a1a1a',
+                    }}
+                  >
+                    {editingProjectName === name ? (
+                      <>
+                        <input
+                          autoFocus
+                          value={editingProjectDraft}
+                          onChange={e => setEditingProjectDraft(e.target.value)}
+                          onKeyDown={e => {
+                            if (e.key === 'Enter') renameProject(name, editingProjectDraft)
+                            if (e.key === 'Escape') { setEditingProjectName(null); setEditingProjectDraft('') }
+                          }}
+                          style={{
+                            flex: 1, background: '#141414', border: '1px solid #2a2a2a',
+                            color: '#e8e4dc', padding: '6px 10px', fontSize: fz(12),
+                            borderRadius: 3, outline: 'none', fontFamily: 'inherit',
+                          }}
+                        />
+                        <button
+                          onClick={() => renameProject(name, editingProjectDraft)}
+                          style={btnStyle('#c8b89a', '#0a0a0a')}
+                        >
+                          Save
+                        </button>
+                        <button
+                          onClick={() => { setEditingProjectName(null); setEditingProjectDraft('') }}
+                          style={btnStyle('#1a1a1a', '#95958c')}
+                        >
+                          Cancel
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <span style={{ flex: 1, fontSize: fz(12), color: '#e2ddd4' }}>{name}</span>
+                        <button
+                          onClick={() => { setEditingProjectName(name); setEditingProjectDraft(name) }}
+                          style={btnStyle('#1a1a1a', '#b0b0a8')}
+                        >
+                          Rename
+                        </button>
+                        <button
+                          onClick={() => deleteProject(name)}
+                          style={btnStyle('#1a1a1a', '#95958c')}
+                        >
+                          Delete
+                        </button>
+                      </>
+                    )}
+                  </div>
+                ))
+              )}
+            </div>
+            <div style={{ marginTop: 16, paddingTop: 16, borderTop: '1px solid #1a1a1a' }}>
+              <button
+                onClick={() => { setShowProjectsModal(false); setEditingProjectName(null); setEditingProjectDraft('') }}
+                style={btnStyle('#1a1a1a', '#b0b0a8')}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -1462,7 +1861,7 @@ function btnStyle(bg: string, color: string) {
     border: `1px solid ${bg === '#1a1a1a' ? '#2a2a2a' : bg}`,
     color,
     padding: '5px 14px',
-    fontSize: 10,
+    fontSize: fz(10),
     letterSpacing: '0.1em',
     cursor: 'pointer',
     borderRadius: 3,

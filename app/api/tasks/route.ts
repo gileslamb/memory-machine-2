@@ -66,6 +66,22 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: true })
   }
 
+  if (action === 'rename_project') {
+    const { oldName, newName } = body
+    if (!oldName || !newName || oldName === newName) return NextResponse.json({ error: 'invalid' }, { status: 400 })
+    db.prepare('UPDATE tasks SET project = ?, updated_at = ? WHERE project = ?').run(newName, now, oldName)
+    db.prepare('UPDATE proposed_tasks SET project = ? WHERE project = ?').run(newName, oldName)
+    return NextResponse.json({ ok: true })
+  }
+
+  if (action === 'clear_project') {
+    const { name } = body
+    if (!name) return NextResponse.json({ error: 'invalid' }, { status: 400 })
+    db.prepare('UPDATE tasks SET project = null, updated_at = ? WHERE project = ?').run(now, name)
+    db.prepare('UPDATE proposed_tasks SET project = null WHERE project = ?').run(name)
+    return NextResponse.json({ ok: true })
+  }
+
   if (action === 'done') {
     const { taskId } = body
     const current = db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId) as { title: string; project: string | null }
